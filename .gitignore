@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.py[cod]
+.idea/
+.vscode/
+.env
+.env.*
+*.pem
+beweissicherung_*/
+beweissicherung_testrun_*/

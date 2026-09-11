@@ -36,6 +36,13 @@ FILTER_OPS = (
 )
 AGG_FNS = ("count", "sum", "avg", "min", "max")
 IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+FK_RE = re.compile(
+    r"FOREIGN KEY\s*\(\s*\"?([A-Za-z_][A-Za-z0-9_]*)\"?\s*\)\s*"
+    r"REFERENCES\s+\"?([A-Za-z_][A-Za-z0-9_.]*)\"?\s*"
+    r"\(\s*\"?([A-Za-z_][A-Za-z0-9_]*)\"?\s*\)",
+    re.I,
+)
 SQL_START_RE = re.compile(r"^\s*(WITH|SELECT)\b", re.I | re.S)
 SQL_BAD_RE = re.compile(
     r"(read_json|read_csv|read_parquet|read_ndjson|read_blob|read_text|"
@@ -147,6 +154,7 @@ def list_tables(folder: str, root: Optional[str] = None) -> list[dict[str, Any]]
                 "columns": [],
                 "row_count": None,
                 "primary_key": [],
+                "foreign_keys": [],
             },
         )
         full = os.path.join(path, fname)
@@ -162,6 +170,7 @@ def list_tables(folder: str, root: Optional[str] = None) -> list[dict[str, Any]]
                 pk = schema.get("primary_key") or []
                 if isinstance(pk, list):
                     info["primary_key"] = [str(x).strip() for x in pk if str(x).strip()]
+                info["foreign_keys"] = _schema_fks(schema)
                 info["display"] = (
                     "%s.%s" % (info["schema"], info["name"]) if info["schema"] else info["name"]
                 )
@@ -201,10 +210,13 @@ def build_sql(
     group_by: Optional[list[str]] = None,
     aggregations: Optional[list[dict[str, Any]]] = None,
     order: Optional[dict[str, str]] = None,
+    date_from: str = "",
+    date_to: str = "",
+    date_column: str = "",
 ) -> str:
     relation_sql = quote_ident(relation)
     col_set = set(columns)
-    where_sql = _where_sql(columns, search, filters or [])
+    where_sql = _where_sql(columns, search, filters or [], date_from, date_to, date_column)
     groups = [_require_column(c, col_set) for c in (group_by or []) if str(c).strip()]
     aggs = [a for a in (aggregations or []) if a]
     select_sql, grouped = _select_sql(columns, groups, aggs)
@@ -231,6 +243,9 @@ def run_query(
     page: int = 0,
     page_size: int = PAGE_SIZE,
     all_rows: bool = False,
+    date_from: str = "",
+    date_to: str = "",
+    date_column: str = "",
     root: Optional[str] = None,
 ) -> dict[str, Any]:
     meta = table_meta(folder, table, root)
@@ -252,7 +267,16 @@ def run_query(
         if not columns and source:
             columns = _peek_columns(folder_path, meta["stem"])
         generated = build_sql(
-            relation, columns, search, filters, group_by, aggregations, order
+            relation,
+            columns,
+            search,
+            filters,
+            group_by,
+            aggregations,
+            order,
+            date_from,
+            date_to,
+            date_column,
         )
         inner = generated
     offset = page * page_size
@@ -290,6 +314,9 @@ def run_query(
         "sql": generated,
         "totals": totals,
         "grouped": bool(group_by or aggregations),
+        "date_column": _pick_date_column(columns, date_column) if (date_from or date_to) else "",
+        "foreign_keys": meta.get("foreign_keys") or [],
+        "primary_key": meta.get("primary_key") or [],
     }
 
 
@@ -307,6 +334,9 @@ def export_bytes(
     aggregations: Optional[list[dict[str, Any]]] = None,
     order: Optional[dict[str, str]] = None,
     sql: Optional[str] = None,
+    date_from: str = "",
+    date_to: str = "",
+    date_column: str = "",
     root: Optional[str] = None,
 ) -> tuple[bytes, str, str]:
     kind = (fmt or "json").strip().lower()
@@ -321,6 +351,9 @@ def export_bytes(
         aggregations=aggregations,
         order=order,
         sql=sql,
+        date_from=date_from,
+        date_to=date_to,
+        date_column=date_column,
         all_rows=True,
         page_size=EXPORT_MAX,
         root=root,
@@ -506,6 +539,115 @@ def export_compare_bytes(
     return payload.encode("utf-8"), "%s_vergleich.json" % stem, "application/json; charset=utf-8"
 
 
+def compare_folders(
+    folder: str,
+    other: str,
+    kinds: Optional[list[str]] = None,
+    root: Optional[str] = None,
+) -> dict[str, Any]:
+    if (folder or "").strip() == (other or "").strip():
+        raise AnalyzeError("Zwei verschiedene Ordner wählen.")
+    left_name = os.path.basename(resolve_backup(folder, root))
+    right_name = os.path.basename(resolve_backup(other, root))
+    left = {t["stem"]: t for t in list_tables(folder, root)}
+    right = {t["stem"]: t for t in list_tables(other, root)}
+    wanted = _folder_kinds(kinds)
+    rows = []
+    summary = {"neu": 0, "gelöscht": 0, "geändert": 0, "gleich": 0}
+    for stem in sorted(set(left) | set(right), key=lambda s: (left.get(s) or right.get(s))["display"].lower()):
+        a = left.get(stem)
+        b = right.get(stem)
+        if a is None:
+            kind = "neu"
+            display = b["display"]
+            here = None
+            there = b.get("row_count")
+        elif b is None:
+            kind = "gelöscht"
+            display = a["display"]
+            here = a.get("row_count")
+            there = None
+        else:
+            display = a["display"]
+            here = a.get("row_count")
+            there = b.get("row_count")
+            kind = "gleich" if here == there else "geändert"
+        summary[kind] = summary.get(kind, 0) + 1
+        if kind not in wanted:
+            continue
+        delta = None
+        if isinstance(here, int) and isinstance(there, int):
+            delta = there - here
+        rows.append(
+            {
+                "Änderung": kind,
+                "Tabelle": display,
+                "stem": stem,
+                "Hier": here,
+                "Dort": there,
+                "Differenz": delta,
+            }
+        )
+    return {
+        "folder": left_name,
+        "other": right_name,
+        "table": "Ordnervergleich",
+        "stem": "",
+        "columns": ["Änderung", "Tabelle", "Hier", "Dort", "Differenz"],
+        "column_meta": [],
+        "rows": rows,
+        "total": len(rows),
+        "page": 0,
+        "page_size": max(len(rows), 1),
+        "sql": "",
+        "totals": None,
+        "grouped": False,
+        "folder_compare": True,
+        "compare": {
+            "folder": left_name,
+            "other": right_name,
+            "pk": ["Tabelle"],
+            "kinds": sorted(wanted),
+            "neu": summary["neu"],
+            "gelöscht": summary["gelöscht"],
+            "geändert": summary["geändert"],
+            "gleich": summary["gleich"],
+        },
+    }
+
+
+def export_folder_compare_bytes(
+    folder: str,
+    other: str,
+    fmt: str = "json",
+    kinds: Optional[list[str]] = None,
+    root: Optional[str] = None,
+) -> tuple[bytes, str, str]:
+    kind = (fmt or "json").strip().lower()
+    if kind not in ("json", "csv"):
+        raise AnalyzeError("Format muss json oder csv sein.")
+    data = compare_folders(folder, other, kinds=kinds, root=root)
+    stem = "ordnervergleich"
+    columns = data["columns"]
+    rows = data["rows"]
+    if kind == "csv":
+        return _to_csv(columns, rows), "%s.csv" % stem, "text/csv; charset=utf-8"
+    payload = json.dumps(
+        {"compare": data.get("compare"), "rows": rows},
+        ensure_ascii=False,
+        indent=2,
+        default=str,
+    )
+    return payload.encode("utf-8"), "%s.json" % stem, "application/json; charset=utf-8"
+
+
+def _folder_kinds(kinds: Optional[list[str]]) -> set[str]:
+    allowed = {"neu", "gelöscht", "geändert", "gleich"}
+    picked = {str(k).strip() for k in (kinds or []) if str(k).strip()}
+    picked &= allowed
+    return picked or {"neu", "gelöscht", "geändert"}
+
+
 def _to_csv(columns: list[str], rows: list[dict[str, Any]]) -> bytes:
     buf = io.StringIO()
     writer = csv.writer(buf, lineterminator="\n")
@@ -576,6 +718,35 @@ def _schema_columns(schema: dict[str, Any]) -> list[dict[str, Any]]:
             }
         )
     return cols
+
+
+def _schema_fks(schema: dict[str, Any]) -> list[dict[str, str]]:
+    out = []
+    seen = set()
+    for item in schema.get("constraints") or []:
+        if str(item.get("type") or "") != "foreign_key":
+            continue
+        match = FK_RE.search(str(item.get("definition") or ""))
+        if not match:
+            continue
+        column, ref_table, ref_column = match.group(1), match.group(2), match.group(3)
+        if "." in ref_table:
+            ref_schema, ref_name = ref_table.split(".", 1)
+        else:
+            ref_schema, ref_name = "", ref_table
+        key = (column, ref_schema, ref_name, ref_column)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(
+            {
+                "column": column,
+                "ref_schema": ref_schema,
+                "ref_table": ref_name,
+                "ref_column": ref_column,
+            }
+        )
+    return out
 
 
 def _count_file_rows(path: str, jsonl: bool) -> Optional[int]:
@@ -653,7 +824,14 @@ def _require_column(name: Any, col_set: set[str]) -> str:
     return col
 
 
-def _where_sql(columns: list[str], search: str, filters: list[dict[str, Any]]) -> str:
+def _where_sql(
+    columns: list[str],
+    search: str,
+    filters: list[dict[str, Any]],
+    date_from: str = "",
+    date_to: str = "",
+    date_column: str = "",
+) -> str:
     parts = []
     term = (search or "").strip()
     if term:
@@ -665,6 +843,9 @@ def _where_sql(columns: list[str], search: str, filters: list[dict[str, Any]]) -
             ors.append("CAST(%s AS VARCHAR) ILIKE %s ESCAPE '\\'" % (quote_ident(col), like))
         if ors:
             parts.append("(%s)" % " OR ".join(ors))
+    date_part = _date_where_sql(columns, date_from, date_to, date_column)
+    if date_part:
+        parts.append(date_part)
     col_set = set(columns)
     for item in filters:
         op = str(item.get("op") or "").strip()
@@ -714,6 +895,42 @@ def _where_sql(columns: list[str], search: str, filters: list[dict[str, Any]]) -
 
 def _escape_like(text: str) -> str:
     return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _pick_date_column(columns: list[str], requested: str = "") -> str:
+    names = [c for c in columns if IDENT_RE.match(c)]
+    want = (requested or "").strip()
+    if want and want in names:
+        return want
+    for name in ("created_at", "updated_at", "createdAt", "updatedAt"):
+        if name in names:
+            return name
+    for col in names:
+        low = col.lower()
+        if low.endswith("_at") or low.endswith("_date") or low in ("date", "timestamp"):
+            return col
+    return ""
+
+
+def _date_where_sql(columns: list[str], date_from: str, date_to: str, date_column: str) -> str:
+    start = (date_from or "").strip()
+    end = (date_to or "").strip()
+    if not start and not end:
+        return ""
+    if start and not DATE_RE.match(start):
+        raise AnalyzeError("Datum von muss JJJJ-MM-TT sein.")
+    if end and not DATE_RE.match(end):
+        raise AnalyzeError("Datum bis muss JJJJ-MM-TT sein.")
+    col = _pick_date_column(columns, date_column)
+    if not col:
+        raise AnalyzeError("Keine Datumsspalte gefunden. created_at oder eine *_at-Spalte wird erwartet.")
+    qcol = "TRY_CAST(%s AS TIMESTAMP)" % quote_ident(col)
+    parts = []
+    if start:
+        parts.append("%s >= TIMESTAMP %s" % (qcol, sql_literal(start)))
+    if end:
+        parts.append("%s < TIMESTAMP %s + INTERVAL '1 day'" % (qcol, sql_literal(end)))
+    return " AND ".join(parts)
 
 
 def _select_sql(

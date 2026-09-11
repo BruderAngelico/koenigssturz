@@ -1001,6 +1001,13 @@ table.data td.rich:hover{background:#fff;}
 table.data td.chg-neu{background:#dcecdc;}
 table.data td.chg-del{background:#f3d6d6;}
 table.data td.chg-chg{background:#f3e6c8;}
+table.data td.jump{cursor:pointer;text-decoration:underline dotted;}
+.chartbox{display:none;border:1px solid #c4bfb4;background:#f7f4ee;padding:8px 10px;margin:6px 0;min-height:120px;}
+.chartbox.on{display:block;}
+#achartcv{width:100%;height:140px;}
+#anote{min-height:52px;width:100%;font-family:inherit;}
+#adatefrom,#adateto{width:132px;}
+#poplinks{display:flex;flex-wrap:wrap;gap:6px;margin-top:6px;}
 </style></head><body>
 <div class="top">
   <h1>Königssturz – Beweissicherung</h1>
@@ -1098,7 +1105,7 @@ table.data td.chg-chg{background:#f3e6c8;}
 <section class="pane" id="analyze">
   <fieldset>
     <legend> 1. Backup-Ordner </legend>
-    <p class="hint">Sicherung wählen. Standard ist der neueste Ordner. Danach eine Tabelle links anklicken. „Überall“ sucht den Text in allen Tabellen dieses Ordners.</p>
+    <p class="hint">Sicherung wählen (Standard: der neueste Ordner). Tabelle links anklicken. „Überall“ sucht in allen Tabellen. „Ordner vergleichen“ stellt die Tabellenlisten zweier Sicherungen gegenüber, „Tabelle vergleichen“ die Zeilen einer Tabelle.</p>
     <div class="inline">
       <label for="afolder">Ordner</label>
       <select id="afolder" onchange="onBackupChange()"></select>
@@ -1111,7 +1118,8 @@ table.data td.chg-chg{background:#f3e6c8;}
       <button class="act" onclick="searchAllTables()">In allen Tabellen</button>
       <label for="acompare">Vergleich mit</label>
       <select id="acompare"></select>
-      <button class="act" onclick="runCompare(0)">Vergleichen</button>
+      <button class="act" onclick="runCompare(0)">Tabelle vergleichen</button>
+      <button class="act" onclick="runFolderCompare()">Ordner vergleichen</button>
     </div>
     <div class="list globbox" id="globbox">
       <div class="head"><span>Tabelle mit Treffer</span><span>Treffer</span></div>
@@ -1140,6 +1148,7 @@ table.data td.chg-chg{background:#f3e6c8;}
         <button class="act" onclick="exportAnalyze('json')">JSON</button>
         <button class="act" onclick="exportAnalyze('csv')">CSV</button>
         <button class="act" onclick="exportAnalyze('png')" title="Nur wenn die aktuelle Seite komplett auf ein Bild passt (max. 40 Zeilen, 16 Spalten)">PNG</button>
+        <button class="act" onclick="exportAnalyze('befund')" title="Markdown mit Notiz, Abfrage und aktueller Tabelle">Befund</button>
         <button class="act" onclick="toggleCols()">Spalten</button>
         <label for="asaved">Abfrage</label>
         <select id="asaved" onchange="onSavedPick()"></select>
@@ -1151,6 +1160,17 @@ table.data td.chg-chg{background:#f3e6c8;}
         <strong>Nur Zeilen wo</strong>
         <div class="filters" id="afilters"></div>
         <button class="act" type="button" onclick="addFilter()">+ Bedingung</button>
+      </div>
+      <div class="inline">
+        <label for="adatefrom">Datum von</label>
+        <input id="adatefrom" type="date" onkeydown="if(event.key==='Enter')applyAnalyze(0)"/>
+        <label for="adateto">bis</label>
+        <input id="adateto" type="date" onkeydown="if(event.key==='Enter')applyAnalyze(0)"/>
+        <span class="hint" style="margin:0">nutzt created_at, sonst die nächste Zeitspalte</span>
+      </div>
+      <div>
+        <strong>Notiz zum Befund</strong>
+        <textarea id="anote" placeholder="Was hast du gefunden? Steht oben in PNG und im Befund-Export."></textarea>
       </div>
       <div class="inline" style="align-items:flex-start;">
         <div>
@@ -1174,10 +1194,12 @@ table.data td.chg-chg{background:#f3e6c8;}
       <div class="colpick" id="colpick"></div>
       <div class="inline" id="cmpkinds" style="display:none">
         <strong>Im Vergleich</strong>
-        <label><input type="checkbox" class="ckind" value="neu" checked onchange="runCompare(0)"/> neu</label>
-        <label><input type="checkbox" class="ckind" value="gelöscht" checked onchange="runCompare(0)"/> gelöscht</label>
-        <label><input type="checkbox" class="ckind" value="geändert" checked onchange="runCompare(0)"/> geändert</label>
+        <label><input type="checkbox" class="ckind" value="neu" checked onchange="onCompareKind()"/> neu</label>
+        <label><input type="checkbox" class="ckind" value="gelöscht" checked onchange="onCompareKind()"/> gelöscht</label>
+        <label><input type="checkbox" class="ckind" value="geändert" checked onchange="onCompareKind()"/> geändert</label>
+        <label id="ckindgleichlab"><input type="checkbox" class="ckind" value="gleich" onchange="onCompareKind()"/> gleich</label>
       </div>
+      <div class="chartbox" id="achart"><canvas id="achartcv"></canvas></div>
       <div class="gridwrap" id="agrid">
         <table class="data" id="atable"><thead></thead><tbody></tbody></table>
       </div>
@@ -1198,6 +1220,7 @@ table.data td.chg-chg{background:#f3e6c8;}
       <button class="act" type="button" onclick="copyCell()">Kopieren</button>
       <button class="act" type="button" onclick="closeCell()">Schließen</button>
     </div>
+    <div id="poplinks"></div>
     <pre id="poppre"></pre>
     <iframe id="popframe" class="popframe" sandbox title="HTML-Vorschau"></iframe>
   </div>
@@ -1350,6 +1373,8 @@ let popHtmlOn=false;
 let analyzeMode='query';
 let hiddenCols={};
 let distinctCache={};
+let popLinkList=[];
+let pendingCompare=false;
 
 function colOptions(selected){
   return '<option value="">Spalte …</option>'+columnMeta.map(function(c){
@@ -1440,6 +1465,11 @@ function selectTable(stem, preset){
   renderColPick();
   fillSavedSelect();
   document.getElementById('agridlegend').textContent=' 3. '+t.display;
+  if(pendingCompare){
+    pendingCompare=false;
+    runCompare(0);
+    return;
+  }
   if(preset) applyPreset(preset);
   else applyAnalyze(0);
 }
@@ -1448,6 +1478,8 @@ function resetBuilder(clearSql){
   document.getElementById('afilters').innerHTML='';
   document.getElementById('agroups').innerHTML='';
   document.getElementById('aaggs').innerHTML='';
+  document.getElementById('adatefrom').value='';
+  document.getElementById('adateto').value='';
   analyzeOrder=null;
   analyzePageNo=0;
   sqlDirty=false;
@@ -1456,6 +1488,7 @@ function resetBuilder(clearSql){
 function resetAnalyze(){
   sqlDirty=false;
   resetBuilder(true);
+  document.getElementById('anote').value='';
   if(selectedTable) applyAnalyze(0);
 }
 function addFilter(col,op,value){
@@ -1525,6 +1558,7 @@ function sqlFromBuilder(){
   applyAnalyze(analyzePageNo);
 }
 function analyzePage(delta){
+  if(analyzeMode==='folders') return;
   const max=analyzeTotal<=0?0:Math.floor((analyzeTotal-1)/analyzePageSize);
   const next=Math.max(0, Math.min(max, analyzePageNo+delta));
   if(next===analyzePageNo && delta) return;
@@ -1607,7 +1641,8 @@ function renderGrid(d){
       const v=row[c];
       if(v===null||v===undefined) return '<td class="null'+chgCls+'">–</td>';
       const kind=cellKind(v);
-      const cls=' class="'+(kind?'rich ':'')+chgCls.trim()+'"'+(kind?' data-kind="'+kind+'"':'');
+  const jump=(cellLinks(c, v).length || (d.folder_compare && c==='Tabelle'))?' jump':'';
+      const cls=' class="'+(kind?'rich ':'')+chgCls.trim()+jump+'"'+(kind?' data-kind="'+kind+'"':'');
       const t=fmtVal(v);
       return '<td'+cls+' data-r="'+ri+'" data-c="'+escAttr(c)+'" title="'+escAttr(cellTxt(v))+'">'+esc(t)+'</td>';
     }).join('')+'</tr>';
@@ -1636,6 +1671,7 @@ function renderGrid(d){
   }
   if(!sqlDirty && !cmp) document.getElementById('asql').value=d.sql||'';
   if(d.column_meta&&d.column_meta.length) columnMeta=d.column_meta;
+  drawChart(d);
 }
 function queryBody(page){
   const body={
@@ -1645,7 +1681,9 @@ function queryBody(page){
     filters:readFilters(),
     group_by:readGroups(),
     aggregations:readAggs(),
-    page:page||0
+    page:page||0,
+    date_from:document.getElementById('adatefrom').value||'',
+    date_to:document.getElementById('adateto').value||''
   };
   if(analyzeOrder) body.order=analyzeOrder;
   if(sqlDirty) body.sql=document.getElementById('asql').value||'';
@@ -1657,6 +1695,10 @@ document.getElementById('atable').addEventListener('click', function(ev){
   const col=td.getAttribute('data-c');
   if(col===null) return;
   const ri=parseInt(td.getAttribute('data-r'),10);
+  if(lastAnalyze.folder_compare && col==='Tabelle'){
+    openFolderHit(ri);
+    return;
+  }
   openCell(ri, col);
 });
 function openCell(ri, col){
@@ -1676,6 +1718,12 @@ function openCell(ri, col){
   document.getElementById('popframe').className='popframe';
   document.getElementById('popframe').removeAttribute('srcdoc');
   document.getElementById('pophtmlbtn').style.display=kind==='html'?'':'none';
+  const links=cellLinks(col, v);
+  popLinkList=links;
+  const box=document.getElementById('poplinks');
+  box.innerHTML=links.map(function(l,i){
+    return '<button class="act" type="button" onclick="jumpLink('+ri+','+i+')">Öffnen: '+esc(l.label)+'</button>';
+  }).join('');
   document.getElementById('cellpop').className='pop on';
 }
 function toggleHtmlPreview(){
@@ -1719,6 +1767,7 @@ async function applyAnalyze(page){
 }
 async function exportAnalyze(fmt){
   if(fmt==='png'){ exportAnalyzePng(); return; }
+  if(fmt==='befund'){ exportBefund(); return; }
   if(!selectedTable){ alert('Zuerst eine Tabelle wählen.'); return; }
   try{
     let url='/api/analyze/export';
@@ -1727,6 +1776,7 @@ async function exportAnalyze(fmt){
       url='/api/analyze/compare/export';
       body=compareBody(0);
       body.format=fmt;
+      if(lastAnalyze&&lastAnalyze.folder_compare) body.folder_compare=true;
     }else{
       body=queryBody(0);
       body.format=fmt;
@@ -1770,6 +1820,14 @@ function queryCaptionLines(){
     lines.push('Vergleich: '+(lastAnalyze.compare.folder||'')+' → '+(lastAnalyze.compare.other||''));
     lines.push('Schlüssel: '+(lastAnalyze.compare.pk&&lastAnalyze.compare.pk.length?lastAnalyze.compare.pk.join(', '):'ganze Zeile'));
   }
+  const df=document.getElementById('adatefrom').value;
+  const dt=document.getElementById('adateto').value;
+  if(df||dt){
+    const col=(lastAnalyze&&lastAnalyze.date_column)||'created_at';
+    lines.push('Zeitraum ('+col+'): '+(df||'…')+' bis '+(dt||'…'));
+  }
+  const note=(document.getElementById('anote').value||'').trim();
+  if(note) lines.push('Notiz: '+note);
   const search=(document.getElementById('asearch').value||'').trim();
   if(search) lines.push('Suche: '+search);
   readFilters().forEach(function(f){
@@ -2141,7 +2199,10 @@ function snapshotQuery(){
     groups:readGroups(),
     aggs:readAggs(),
     order:analyzeOrder,
-    sql:sqlDirty?(document.getElementById('asql').value||''):''
+    sql:sqlDirty?(document.getElementById('asql').value||''):'',
+    date_from:document.getElementById('adatefrom').value||'',
+    date_to:document.getElementById('adateto').value||'',
+    note:document.getElementById('anote').value||''
   };
 }
 function applyPreset(preset){
@@ -2152,6 +2213,9 @@ function applyPreset(preset){
   }
   resetBuilder(true);
   document.getElementById('asearch').value=preset.search||'';
+  document.getElementById('adatefrom').value=preset.date_from||'';
+  document.getElementById('adateto').value=preset.date_to||'';
+  if(preset.note) document.getElementById('anote').value=preset.note;
   (preset.filters||[]).forEach(function(f){ addFilter(f.column, f.op, f.value); });
   (preset.groups||[]).forEach(function(c){ addGroup(c); });
   (preset.aggs||[]).forEach(function(a){ addAgg(a.fn, a.column==='*'?'':a.column); });
@@ -2190,6 +2254,167 @@ function deleteSavedQuery(){
 }
 try{ hiddenCols=JSON.parse(localStorage.getItem('analyzeHiddenCols')||'{}')||{}; }
 catch(e){ hiddenCols={}; }
+function onCompareKind(){
+  if(analyzeMode==='folders') runFolderCompare();
+  else if(analyzeMode==='compare') runCompare(0);
+}
+async function runFolderCompare(){
+  const other=document.getElementById('acompare').value;
+  if(!currentFolder()){ alert('Zuerst einen Ordner wählen.'); return; }
+  if(!other){ alert('Eine zweite Sicherung unter „Vergleich mit“ wählen.'); return; }
+  analyzeMode='folders';
+  const seq=++analyzeSeq;
+  analyzeBusy=true;
+  document.getElementById('aresult').textContent='Vergleiche Ordner …';
+  document.getElementById('agridlegend').textContent=' 3. Ordnervergleich';
+  try{
+    const r=await fetch('/api/analyze/compare-folders',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({folder:currentFolder(), other:other, kinds:readCompareKinds()})});
+    const d=await r.json().catch(function(){return {};});
+    if(seq!==analyzeSeq) return;
+    if(!r.ok) throw new Error(d.detail||d.error||'Fehler');
+    setAnalyzeErr('');
+    renderGrid(d);
+  }catch(e){
+    if(seq!==analyzeSeq) return;
+    setAnalyzeErr(e.message||String(e));
+    document.getElementById('aresult').textContent='Fehler';
+    analyzeMode='query';
+  }finally{
+    if(seq===analyzeSeq) analyzeBusy=false;
+  }
+}
+function openFolderHit(ri){
+  const row=(lastAnalyze.rows||[])[ri];
+  if(!row||!row.stem) return;
+  const t=analyzeTables.filter(function(x){return x.stem===row.stem;})[0];
+  if(!t){ alert('Diese Tabelle gibt es in der aktuellen Sicherung nicht.'); return; }
+  pendingCompare=true;
+  selectTable(row.stem);
+}
+function findLinkTable(name, schema){
+  const low=String(name||'').toLowerCase();
+  const schemaLow=String(schema||'').toLowerCase();
+  let hit=analyzeTables.filter(function(t){
+    return (t.name||'').toLowerCase()===low && (!schemaLow || (t.schema||'').toLowerCase()===schemaLow);
+  })[0];
+  if(hit) return hit;
+  return analyzeTables.filter(function(t){
+    return (t.stem||'').toLowerCase().indexOf(low)>=0 || (t.display||'').toLowerCase().indexOf('.'+low)>=0;
+  })[0];
+}
+function cellLinks(col, value){
+  if(value===null||value===undefined||value==='') return [];
+  if(typeof value==='object') return [];
+  if(analyzeMode==='compare'||analyzeMode==='folders'||(lastAnalyze&&lastAnalyze.folder_compare)) return [];
+  const text=String(value);
+  if(!text) return [];
+  const out=[];
+  const seen={};
+  function add(stem, column, label){
+    const k=stem+'|'+column;
+    if(seen[k]) return;
+    if(selectedTable && stem===selectedTable.stem && column===col) return;
+    seen[k]=1;
+    out.push({stem:stem, column:column, value:text, label:label});
+  }
+  ((selectedTable&&selectedTable.foreign_keys)||[]).forEach(function(fk){
+    if(fk.column!==col) return;
+    const t=findLinkTable(fk.ref_table, fk.ref_schema);
+    if(t) add(t.stem, fk.ref_column||'id', t.display+' · '+(fk.ref_column||'id'));
+  });
+  const interesting=col==='mitgliedsnummer'||col==='invoice_id'||col==='invoice_number'||col==='id'||/_id$/.test(col);
+  if(interesting){
+    analyzeTables.forEach(function(t){
+      if(selectedTable && t.stem===selectedTable.stem) return;
+      const names=(t.columns||[]).map(function(c){ return c.name||c; });
+      if(names.indexOf(col)>=0) add(t.stem, col, t.display+' · '+col);
+    });
+  }
+  if(/_id$/.test(col) && col!=='id'){
+    const base=col.slice(0,-3).toLowerCase();
+    analyzeTables.forEach(function(t){
+      const n=(t.name||'').toLowerCase();
+      if(n===base||n===base+'s'||n.slice(-base.length-1)==='_'+base||n.indexOf(base)>=0){
+        const pk=(t.primary_key&&t.primary_key[0])||'id';
+        add(t.stem, pk, t.display+' · '+pk);
+      }
+    });
+  }
+  return out.slice(0,6);
+}
+function jumpLink(ri, idx){
+  const row=(lastAnalyze.rows||[])[ri];
+  const link=popLinkList[idx];
+  if(!row||!link) return;
+  closeCell();
+  selectTable(link.stem, {search:'', filters:[{column:link.column, op:'eq', value:link.value}], groups:[], aggs:[]});
+}
+function drawChart(d){
+  const box=document.getElementById('achart');
+  const cv=document.getElementById('achartcv');
+  if(!box||!cv) return;
+  if(!d || !d.grouped || !(d.rows||[]).length){ box.className='chartbox'; return; }
+  const cols=d.columns||[];
+  const num=cols.filter(function(c){
+    const low=String(c).toLowerCase();
+    return low==='anzahl'||low.indexOf('anzahl_')===0||low.indexOf('summe_')===0;
+  });
+  const cat=cols.filter(function(c){ return num.indexOf(c)<0; })[0];
+  const val=num[0];
+  if(!cat||!val){ box.className='chartbox'; return; }
+  const rows=(d.rows||[]).slice(0,24).map(function(r){
+    return {label:String(r[cat]==null?'–':r[cat]), n:Number(r[val])||0};
+  });
+  const max=Math.max.apply(null, rows.map(function(r){return r.n;}).concat([1]));
+  box.className='chartbox on';
+  const w=Math.max(box.clientWidth||640, 320);
+  const h=140;
+  const dpr=Math.min(2, window.devicePixelRatio||1);
+  cv.width=Math.ceil(w*dpr);
+  cv.height=Math.ceil(h*dpr);
+  cv.style.width=w+'px';
+  cv.style.height=h+'px';
+  const ctx=cv.getContext('2d');
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+  ctx.fillStyle='#f7f4ee';
+  ctx.fillRect(0,0,w,h);
+  const gap=6;
+  const barW=Math.max(8,(w-24)/rows.length-gap);
+  ctx.font='11px system-ui, Helvetica, Arial, sans-serif';
+  rows.forEach(function(r,i){
+    const bh=Math.max(2,(h-36)*r.n/max);
+    const x=12+i*(barW+gap);
+    ctx.fillStyle='#3d6b99';
+    ctx.fillRect(x, h-20-bh, barW, bh);
+    ctx.fillStyle='#111';
+    ctx.textAlign='center';
+    ctx.fillText(String(r.n), x+barW/2, h-24-bh);
+    ctx.fillText(ellipsizeCanvas(ctx, r.label, barW+8), x+barW/2, h-6);
+  });
+}
+function exportBefund(){
+  if(!lastAnalyze){ alert('Keine Ergebnisse zum Export. Zuerst Anwenden.'); return; }
+  const cols=visibleCols(lastAnalyze.columns||[]);
+  const rows=lastAnalyze.rows||[];
+  const md=['# Königssturz – Befund',''];
+  queryCaptionLines().forEach(function(l){ md.push('- '+l); });
+  md.push('','## Daten','');
+  if(cols.length){
+    md.push('| '+cols.join(' | ')+' |');
+    md.push('| '+cols.map(function(){return '---';}).join(' | ')+' |');
+    rows.forEach(function(row){
+      md.push('| '+cols.map(function(c){
+        return String(fmtVal(row[c])).replace(/\|/g,'\\|').replace(/\n/g,' ');
+      }).join(' | ')+' |');
+    });
+  }
+  if((lastAnalyze.total||0)>rows.length){
+    md.push('','Nur die aktuelle Seite. Alle Zeilen: JSON oder CSV exportieren.');
+  }
+  const stamp=new Date().toISOString().slice(0,19).replace(/[:T]/g,'-');
+  const name=(selectedTable&&selectedTable.display||'befund').replace(/[^\w.\-]+/g,'_')+'_befund_'+stamp+'.md';
+  downloadBlob(new Blob([md.join('\n')],{type:'text/markdown;charset=utf-8'}), name);
+}
 function initSplit(){
   const bar=document.getElementById('splitbar');
   const box=document.getElementById('tlistbox');
@@ -2376,6 +2601,9 @@ def api_analyze_query(body: Dict[str, Any]):
             sql=body.get("sql") or "",
             page=body.get("page") or 0,
             page_size=body.get("page_size") or ka.PAGE_SIZE,
+            date_from=body.get("date_from") or "",
+            date_to=body.get("date_to") or "",
+            date_column=body.get("date_column") or "",
         )
 
     return _analyze(job)
@@ -2394,6 +2622,9 @@ def api_analyze_export(body: Dict[str, Any]):
             aggregations=body.get("aggregations") or [],
             order=body.get("order"),
             sql=body.get("sql") or "",
+            date_from=body.get("date_from") or "",
+            date_to=body.get("date_to") or "",
+            date_column=body.get("date_column") or "",
         )
     except ka.AnalyzeError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -2419,16 +2650,36 @@ def api_analyze_compare(body: Dict[str, Any]):
     return _analyze(job)
 
 
+@app.post("/api/analyze/compare-folders")
+def api_analyze_compare_folders(body: Dict[str, Any]):
+    def job():
+        return ka.compare_folders(
+            folder=body.get("folder") or "",
+            other=body.get("other") or "",
+            kinds=body.get("kinds") or [],
+        )
+
+    return _analyze(job)
+
+
 @app.post("/api/analyze/compare/export")
 def api_analyze_compare_export(body: Dict[str, Any]):
     try:
-        payload, filename, media = ka.export_compare_bytes(
-            folder=body.get("folder") or "",
-            other=body.get("other") or "",
-            table=body.get("table") or "",
-            fmt=body.get("format") or "json",
-            kinds=body.get("kinds") or [],
-        )
+        if body.get("folder_compare"):
+            payload, filename, media = ka.export_folder_compare_bytes(
+                folder=body.get("folder") or "",
+                other=body.get("other") or "",
+                fmt=body.get("format") or "json",
+                kinds=body.get("kinds") or [],
+            )
+        else:
+            payload, filename, media = ka.export_compare_bytes(
+                folder=body.get("folder") or "",
+                other=body.get("other") or "",
+                table=body.get("table") or "",
+                fmt=body.get("format") or "json",
+                kinds=body.get("kinds") or [],
+            )
     except ka.AnalyzeError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     return Response(

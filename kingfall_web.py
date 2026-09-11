@@ -968,8 +968,9 @@ textarea.paused{background:#fff4cc;}
 .agrid fieldset{min-height:0;}
 .filters{display:flex;flex-direction:column;gap:4px;margin:4px 0;}
 .filterrow{display:flex;flex-wrap:wrap;align-items:center;gap:6px;}
-.filterrow select,.filterrow input[type=text]{font:inherit;border:1px solid #c4bfb4;background:var(--field);padding:3px 6px;}
-.filterrow input[type=text]{width:160px;}
+.filterrow select,.filterrow input{font:inherit;border:1px solid #c4bfb4;background:var(--field);padding:3px 6px;}
+.filterrow input{width:160px;}
+.filterrow .fsep{font-weight:400;color:#5c584f;}
 .gridwrap{flex:1;overflow:auto;border:1px solid #c4bfb4;background:#f7f4ee;min-height:140px;}
 table.data{border-collapse:collapse;width:max-content;min-width:100%;font-size:12px;}
 table.data th,table.data td{border-bottom:1px solid #ddd;padding:4px 8px;white-space:nowrap;max-width:280px;overflow:hidden;text-overflow:ellipsis;vertical-align:top;}
@@ -1001,12 +1002,14 @@ table.data td.rich:hover{background:#fff;}
 table.data td.chg-neu{background:#dcecdc;}
 table.data td.chg-del{background:#f3d6d6;}
 table.data td.chg-chg{background:#f3e6c8;}
+table.data td.chg-field{box-shadow:inset 0 -2px 0 #9a7b2f;font-weight:700;}
 table.data td.jump{cursor:pointer;text-decoration:underline dotted;}
 .chartbox{display:none;border:1px solid #c4bfb4;background:#f7f4ee;padding:8px 10px;margin:6px 0;min-height:120px;}
 .chartbox.on{display:block;}
 #achartcv{width:100%;height:140px;}
 #anote{min-height:52px;width:100%;font-family:inherit;}
-#adatefrom,#adateto{width:132px;}
+#adatefrom,#adateto{width:148px;}
+#adatecol,#adategrain{min-width:120px;}
 #poplinks{display:flex;flex-wrap:wrap;gap:6px;margin-top:6px;}
 </style></head><body>
 <div class="top">
@@ -1148,7 +1151,9 @@ table.data td.jump{cursor:pointer;text-decoration:underline dotted;}
         <button class="act" onclick="exportAnalyze('json')">JSON</button>
         <button class="act" onclick="exportAnalyze('csv')">CSV</button>
         <button class="act" onclick="exportAnalyze('png')" title="Nur wenn die aktuelle Seite komplett auf ein Bild passt (max. 40 Zeilen, 16 Spalten)">PNG</button>
-        <button class="act" onclick="exportAnalyze('befund')" title="Markdown mit Notiz, Abfrage und aktueller Tabelle">Befund</button>
+        <button class="act" onclick="exportAnalyze('befund')" title="Markdown mit Notiz, Abfrage und aktueller Tabelle, plus Akte">Befund</button>
+        <button class="act" onclick="addToAkte()" title="Aktuelle Ansicht in die Befund-Akte legen">Zur Akte</button>
+        <span class="status" id="aktehint">Akte leer</span>
         <button class="act" onclick="toggleCols()">Spalten</button>
         <label for="asaved">Abfrage</label>
         <select id="asaved" onchange="onSavedPick()"></select>
@@ -1160,13 +1165,21 @@ table.data td.jump{cursor:pointer;text-decoration:underline dotted;}
         <strong>Nur Zeilen wo</strong>
         <div class="filters" id="afilters"></div>
         <button class="act" type="button" onclick="addFilter()">+ Bedingung</button>
+        <span class="hint" style="margin-left:8px">Bei Datum/Zeit: „zwischen“ mit Monat (z. B. 2026-01 bis 2026-03). Taggenau: größer gleich / kleiner gleich.</span>
       </div>
       <div class="inline">
-        <label for="adatefrom">Datum von</label>
+        <label for="adatecol">Zeitraum</label>
+        <select id="adatecol" title="Welche Datumsspalte gefiltert wird"></select>
+        <select id="adategrain" onchange="syncDateGrain()" title="Taggenau oder ganzer Monat">
+          <option value="day">Tag</option>
+          <option value="month">Monat</option>
+        </select>
+        <label for="adatefrom">von</label>
         <input id="adatefrom" type="date" onkeydown="if(event.key==='Enter')applyAnalyze(0)"/>
         <label for="adateto">bis</label>
         <input id="adateto" type="date" onkeydown="if(event.key==='Enter')applyAnalyze(0)"/>
-        <span class="hint" style="margin:0">nutzt created_at, sonst die nächste Zeitspalte</span>
+        <button class="act" type="button" onclick="sumInPeriod()" title="Anzahl oder Summe je Monat der gewählten Datumsspalte">Summe</button>
+        <span class="hint" style="margin:0">einschließlich; Summe nutzt total_amount falls vorhanden</span>
       </div>
       <div>
         <strong>Notiz zum Befund</strong>
@@ -1218,6 +1231,7 @@ table.data td.jump{cursor:pointer;text-decoration:underline dotted;}
       <span class="status" id="popkind"></span>
       <button class="act" type="button" id="pophtmlbtn" onclick="toggleHtmlPreview()" style="display:none">HTML-Vorschau</button>
       <button class="act" type="button" onclick="copyCell()">Kopieren</button>
+      <button class="act" type="button" id="popfilterbtn" onclick="filterOpenCell()" style="display:none">Als Filter</button>
       <button class="act" type="button" onclick="closeCell()">Schließen</button>
     </div>
     <div id="poplinks"></div>
@@ -1340,13 +1354,18 @@ setInterval(tick,1000); tick();
 const FILTER_OPS=[
   {id:'eq',label:'ist'},
   {id:'ne',label:'ist nicht'},
+  {id:'in',label:'ist einer von'},
+  {id:'not_in',label:'ist nicht einer von'},
   {id:'contains',label:'enthält'},
   {id:'not_contains',label:'enthält nicht'},
   {id:'starts',label:'beginnt mit'},
   {id:'empty',label:'ist leer'},
   {id:'not_empty',label:'ist nicht leer'},
   {id:'gt',label:'größer als'},
-  {id:'lt',label:'kleiner als'}
+  {id:'gte',label:'größer gleich'},
+  {id:'lt',label:'kleiner als'},
+  {id:'lte',label:'kleiner gleich'},
+  {id:'between',label:'zwischen'}
 ];
 const AGG_FNS=[
   {id:'count',label:'Anzahl'},
@@ -1375,6 +1394,8 @@ let hiddenCols={};
 let distinctCache={};
 let popLinkList=[];
 let pendingCompare=false;
+let popFilterRi=null;
+let popFilterCol='';
 
 function colOptions(selected){
   return '<option value="">Spalte …</option>'+columnMeta.map(function(c){
@@ -1382,7 +1403,96 @@ function colOptions(selected){
     return '<option value="'+esc(n)+'"'+(selected===n?' selected':'')+'>'+esc(n)+'</option>';
   }).join('');
 }
+function groupColOptions(selected){
+  let html=colOptions(selected);
+  columnMeta.forEach(function(c){
+    const n=c.name||c;
+    if(!isDateishCol(n)) return;
+    const val=n+':month';
+    html+='<option value="'+esc(val)+'"'+(selected===val?' selected':'')+'>'+esc(n)+' (Monat)</option>';
+  });
+  return html;
+}
+function groupLabel(g){
+  if(g && g.length>6 && g.slice(-6)===':month') return g.slice(0,-6)+' (Monat)';
+  return g||'';
+}
 function needsValue(op){ return op!=='empty' && op!=='not_empty'; }
+function needsTwoValues(op){ return op==='between'; }
+function isDateishCol(name){
+  const n=(name||'').toLowerCase();
+  if(!n) return false;
+  const meta=columnMeta.filter(function(c){ return (c.name||c)===name; })[0];
+  const t=((meta&&meta.data_type)||'').toLowerCase();
+  if(/date|time|timestamp/.test(t)) return true;
+  if(/(_at|_date|_time)$/.test(n)) return true;
+  if(n==='date'||n==='timestamp') return true;
+  if(n.indexOf('period')>=0) return true;
+  return false;
+}
+function isCompareOp(op){ return op==='gt'||op==='gte'||op==='lt'||op==='lte'||op==='between'; }
+function fillDateCols(){
+  const sel=document.getElementById('adatecol');
+  if(!sel) return;
+  const prev=sel.value;
+  const cols=columnMeta.map(function(c){ return c.name||c; }).filter(isDateishCol);
+  sel.innerHTML='<option value="">automatisch</option>'+cols.map(function(n){
+    return '<option value="'+esc(n)+'">'+esc(n)+'</option>';
+  }).join('');
+  if(prev && cols.indexOf(prev)>=0) sel.value=prev;
+}
+function syncDateGrain(){
+  const grain=(document.getElementById('adategrain')&&document.getElementById('adategrain').value)||'day';
+  const next=grain==='month'?'month':'date';
+  ['adatefrom','adateto'].forEach(function(id){
+    const el=document.getElementById(id);
+    if(!el) return;
+    const keep=el.value;
+    if(el.type!==next){
+      el.type=next;
+      if(keep){
+        if(next==='month' && /^\d{4}-\d{2}/.test(keep)) el.value=keep.slice(0,7);
+        else if(next==='date' && /^\d{4}-\d{2}$/.test(keep)) el.value=keep+'-01';
+        else if(!el.value) el.value=keep;
+      }
+    }
+  });
+}
+function guessDateCol(){
+  const sel=document.getElementById('adatecol');
+  if(sel && sel.value) return sel.value;
+  if(lastAnalyze&&lastAnalyze.date_column) return lastAnalyze.date_column;
+  const cols=columnMeta.map(function(c){ return c.name||c; });
+  const prefer=['created_at','updated_at','createdAt','updatedAt'];
+  for(let i=0;i<prefer.length;i++){ if(cols.indexOf(prefer[i])>=0) return prefer[i]; }
+  return cols.filter(isDateishCol)[0]||'';
+}
+function pickAmountCol(){
+  const cols=columnMeta.map(function(c){ return c.name||c; });
+  const prefer=['total_amount','amount','betrag','brutto','netto','summe'];
+  for(let i=0;i<prefer.length;i++){ if(cols.indexOf(prefer[i])>=0) return prefer[i]; }
+  for(let i=0;i<cols.length;i++){
+    const n=String(cols[i]||'');
+    if(/amount|betrag|summe|preis|total/i.test(n) && !/_id$/i.test(n)) return n;
+  }
+  return '';
+}
+function sumInPeriod(){
+  if(!selectedTable){ alert('Zuerst eine Tabelle wählen.'); return; }
+  const dateCol=guessDateCol();
+  const amount=pickAmountCol();
+  const cols=columnMeta.map(function(c){ return c.name||c; });
+  const hasStatus=cols.indexOf('status')>=0;
+  document.getElementById('agroups').innerHTML='';
+  document.getElementById('aaggs').innerHTML='';
+  sqlDirty=false;
+  if(dateCol) addGroup(dateCol+':month');
+  else if(hasStatus) addGroup('status');
+  else { alert('Keine Datumsspalte und kein Status zum Gruppieren.'); return; }
+  if(amount) addAgg('sum', amount);
+  else addAgg('count');
+  applyAnalyze(0);
+}
 function currentFolder(){ return document.getElementById('afolder').value; }
 function setAnalyzeErr(msg){ document.getElementById('aerr').textContent=msg||''; }
 async function analyzeGet(url){
@@ -1461,6 +1571,7 @@ function selectTable(stem, preset){
   analyzeMode='query';
   document.getElementById('cmpkinds').style.display='none';
   resetBuilder(true);
+  fillDateCols();
   renderTableList();
   renderColPick();
   fillSavedSelect();
@@ -1480,6 +1591,8 @@ function resetBuilder(clearSql){
   document.getElementById('aaggs').innerHTML='';
   document.getElementById('adatefrom').value='';
   document.getElementById('adateto').value='';
+  const dcol=document.getElementById('adatecol');
+  if(dcol) dcol.value='';
   analyzeOrder=null;
   analyzePageNo=0;
   sqlDirty=false;
@@ -1491,7 +1604,7 @@ function resetAnalyze(){
   document.getElementById('anote').value='';
   if(selectedTable) applyAnalyze(0);
 }
-function addFilter(col,op,value){
+function addFilter(col,op,value,value2){
   const wrap=document.createElement('div');
   wrap.className='filterrow';
   const listId='fdl-'+Math.random().toString(36).slice(2,8);
@@ -1499,6 +1612,8 @@ function addFilter(col,op,value){
     +'<select class="fop">'+FILTER_OPS.map(function(o){return '<option value="'+o.id+'"'+(op===o.id?' selected':'')+'>'+o.label+'</option>';}).join('')+'</select>'
     +'<input class="fval" type="text" list="'+listId+'" value="'+esc(value||'')+'"/>'
     +'<datalist id="'+listId+'"></datalist>'
+    +'<span class="fsep">bis</span>'
+    +'<input class="fval2" type="text" value="'+esc(value2||'')+'"/>'
     +'<button class="act" type="button">Entfernen</button>';
   wrap.querySelector('button').onclick=function(){ wrap.remove(); };
   wrap.querySelector('.fop').onchange=function(){ syncFilterValue(wrap); };
@@ -1510,12 +1625,50 @@ function addFilter(col,op,value){
 }
 function syncFilterValue(wrap){
   const op=wrap.querySelector('.fop').value;
-  wrap.querySelector('.fval').style.display=needsValue(op)?'':'none';
+  const col=wrap.querySelector('.fcol').value;
+  const a=wrap.querySelector('.fval');
+  const b=wrap.querySelector('.fval2');
+  const sep=wrap.querySelector('.fsep');
+  const list=wrap.querySelector('datalist');
+  const keepA=a.value;
+  const keepB=b.value;
+  const two=needsTwoValues(op);
+  const show=needsValue(op);
+  const dateish=isDateishCol(col) && isCompareOp(op);
+  a.style.display=show?'':'none';
+  b.style.display=two?'':'none';
+  sep.style.display=two?'':'none';
+  const listed=op==='in'||op==='not_in';
+  if(dateish && two){
+    if(a.type!=='month') a.type='month';
+    if(b.type!=='month') b.type='month';
+    a.placeholder='von Monat'; b.placeholder='bis Monat';
+    a.title='Monat von, z. B. 2026-01';
+    b.title='Monat bis, z. B. 2026-03 – der ganze Monat zählt mit';
+    a.removeAttribute('list');
+  }else if(dateish){
+    if(a.type!=='text') a.type='text';
+    if(b.type!=='text') b.type='text';
+    a.placeholder='2026-01 oder 2026-01-15';
+    a.title='Monat (2026-01, ganzer Monat) oder Tag (2026-01-15, der ganze Tag). Mehrere Monate: „zwischen“.';
+    if(list) a.setAttribute('list', list.id);
+  }else{
+    if(a.type!=='text') a.type='text';
+    if(b.type!=='text') b.type='text';
+    a.placeholder=listed?'Wert, Wert, …':(two?'von':'');
+    b.placeholder=two?'bis':'';
+    a.title=listed?'Mehrere Werte mit Komma oder Zeilenumbruch.':'';
+    b.title='';
+    if(list) a.setAttribute('list', list.id);
+  }
+  if(keepA && !a.value) a.value=keepA;
+  if(keepB && !b.value) b.value=keepB;
+  a.style.width=(listed && !dateish)?'240px':'';
 }
 function addGroup(col){
   const wrap=document.createElement('div');
   wrap.className='filterrow';
-  wrap.innerHTML='<select class="gcol">'+colOptions(col||'')+'</select><button class="act" type="button">Entfernen</button>';
+  wrap.innerHTML='<select class="gcol">'+groupColOptions(col||'')+'</select><button class="act" type="button">Entfernen</button>';
   wrap.querySelector('button').onclick=function(){ wrap.remove(); };
   document.getElementById('agroups').appendChild(wrap);
 }
@@ -1536,7 +1689,14 @@ function syncAggCol(wrap){
 }
 function readFilters(){
   return [].slice.call(document.querySelectorAll('#afilters .filterrow')).map(function(row){
-    return {column:row.querySelector('.fcol').value, op:row.querySelector('.fop').value, value:row.querySelector('.fval').value};
+    const item={
+      column:row.querySelector('.fcol').value,
+      op:row.querySelector('.fop').value,
+      value:row.querySelector('.fval').value
+    };
+    const v2=row.querySelector('.fval2');
+    if(v2 && v2.value) item.value2=v2.value;
+    return item;
   }).filter(function(f){ return f.column && f.op; });
 }
 function readGroups(){
@@ -1637,14 +1797,18 @@ function renderGrid(d){
   const rows=(d.rows||[]).map(function(row,ri){
     const chg=row['Änderung']||'';
     const chgCls=chg==='neu'?' chg-neu':chg==='gelöscht'?' chg-del':chg==='geändert'?' chg-chg':'';
+    const chgMap=row._chg||{};
     return '<tr>'+cols.map(function(c){
       const v=row[c];
-      if(v===null||v===undefined) return '<td class="null'+chgCls+'">–</td>';
+      const field=chgMap[c];
+      const fieldCls=field?' chg-field':'';
+      if(v===null||v===undefined) return '<td class="null'+chgCls+fieldCls+'">–</td>';
       const kind=cellKind(v);
   const jump=(cellLinks(c, v).length || (d.folder_compare && c==='Tabelle'))?' jump':'';
-      const cls=' class="'+(kind?'rich ':'')+chgCls.trim()+jump+'"'+(kind?' data-kind="'+kind+'"':'');
+      const cls=' class="'+(kind?'rich ':'')+(chgCls+fieldCls).trim()+jump+'"'+(kind?' data-kind="'+kind+'"':'');
       const t=fmtVal(v);
-      return '<td'+cls+' data-r="'+ri+'" data-c="'+escAttr(c)+'" title="'+escAttr(cellTxt(v))+'">'+esc(t)+'</td>';
+      const tip=field?(field.alt+' → '+field.neu):cellTxt(v);
+      return '<td'+cls+' data-r="'+ri+'" data-c="'+escAttr(c)+'" title="'+escAttr(tip)+'">'+esc(t)+'</td>';
     }).join('')+'</tr>';
   }).join('');
   let totals='';
@@ -1670,7 +1834,10 @@ function renderGrid(d){
     document.getElementById('aresult').textContent=(d.grouped?'Gruppen: ':'Zeilen: ')+fmt(analyzeTotal);
   }
   if(!sqlDirty && !cmp) document.getElementById('asql').value=d.sql||'';
-  if(d.column_meta&&d.column_meta.length) columnMeta=d.column_meta;
+  if(d.column_meta&&d.column_meta.length){
+    columnMeta=d.column_meta;
+    fillDateCols();
+  }
   drawChart(d);
 }
 function queryBody(page){
@@ -1683,7 +1850,8 @@ function queryBody(page){
     aggregations:readAggs(),
     page:page||0,
     date_from:document.getElementById('adatefrom').value||'',
-    date_to:document.getElementById('adateto').value||''
+    date_to:document.getElementById('adateto').value||'',
+    date_column:document.getElementById('adatecol').value||''
   };
   if(analyzeOrder) body.order=analyzeOrder;
   if(sqlDirty) body.sql=document.getElementById('asql').value||'';
@@ -1697,6 +1865,10 @@ document.getElementById('atable').addEventListener('click', function(ev){
   const ri=parseInt(td.getAttribute('data-r'),10);
   if(lastAnalyze.folder_compare && col==='Tabelle'){
     openFolderHit(ri);
+    return;
+  }
+  if(ev.shiftKey){
+    filterFromCell(ri, col);
     return;
   }
   openCell(ri, col);
@@ -1720,11 +1892,64 @@ function openCell(ri, col){
   document.getElementById('pophtmlbtn').style.display=kind==='html'?'':'none';
   const links=cellLinks(col, v);
   popLinkList=links;
+  popFilterRi=ri;
+  popFilterCol=col;
   const box=document.getElementById('poplinks');
   box.innerHTML=links.map(function(l,i){
     return '<button class="act" type="button" onclick="jumpLink('+ri+','+i+')">Öffnen: '+esc(l.label)+'</button>';
   }).join('');
+  const fbtn=document.getElementById('popfilterbtn');
+  if(fbtn) fbtn.style.display=canFilterCell(col,v)?'':'none';
   document.getElementById('cellpop').className='pop on';
+}
+function canFilterCell(col, v){
+  if(!col || col==='Änderung'||col==='Schlüssel'||col==='Diff'||col==='Tabelle') return false;
+  if(lastAnalyze&&lastAnalyze.folder_compare) return false;
+  const kind=cellKind(v);
+  if(kind==='json'||kind==='html'||kind==='xml') return false;
+  return true;
+}
+function filterOpenCell(){
+  if(popFilterRi===null || !popFilterCol) return;
+  filterFromCell(popFilterRi, popFilterCol);
+}
+function filterFromCell(ri, col){
+  if(!selectedTable) return;
+  const row=(lastAnalyze&&lastAnalyze.rows||[])[ri];
+  if(!row || !canFilterCell(col, row[col])) return;
+  const v=row[col];
+  closeCell();
+  sqlDirty=false;
+  if(v===null||v===undefined||v===''){
+    addFilter(col,'empty');
+    applyAnalyze(0);
+    return;
+  }
+  const text=typeof v==='object'?JSON.stringify(v):String(v);
+  const rows=document.querySelectorAll('#afilters .filterrow');
+  for(let i=0;i<rows.length;i++){
+    const wrap=rows[i];
+    if(wrap.querySelector('.fcol').value!==col) continue;
+    const op=wrap.querySelector('.fop').value;
+    const inp=wrap.querySelector('.fval');
+    if(op==='eq'||op==='in'){
+      const cur=(inp.value||'').trim();
+      if(op==='eq' && cur===text){ applyAnalyze(0); return; }
+      if(op==='eq'){
+        wrap.querySelector('.fop').value='in';
+        inp.value=cur?(cur+', '+text):text;
+        syncFilterValue(wrap);
+      }else{
+        const parts=cur.split(/[\n,;]+/).map(function(s){return s.trim();}).filter(Boolean);
+        if(parts.indexOf(text)<0) parts.push(text);
+        inp.value=parts.join(', ');
+      }
+      applyAnalyze(0);
+      return;
+    }
+  }
+  addFilter(col,'eq',text);
+  applyAnalyze(0);
 }
 function toggleHtmlPreview(){
   popHtmlOn=!popHtmlOn;
@@ -1823,7 +2048,7 @@ function queryCaptionLines(){
   const df=document.getElementById('adatefrom').value;
   const dt=document.getElementById('adateto').value;
   if(df||dt){
-    const col=(lastAnalyze&&lastAnalyze.date_column)||'created_at';
+    const col=document.getElementById('adatecol').value||(lastAnalyze&&lastAnalyze.date_column)||'created_at';
     lines.push('Zeitraum ('+col+'): '+(df||'…')+' bis '+(dt||'…'));
   }
   const note=(document.getElementById('anote').value||'').trim();
@@ -1832,11 +2057,13 @@ function queryCaptionLines(){
   if(search) lines.push('Suche: '+search);
   readFilters().forEach(function(f){
     let s='Nur Zeilen wo: '+f.column+' '+opLabel(f.op);
-    if(needsValue(f.op) && f.value) s+=' „'+f.value+'“';
+    if(f.op==='between' && (f.value||f.value2)) s+=' „'+(f.value||'')+'“ bis „'+(f.value2||'')+'“';
+    else if((f.op==='in'||f.op==='not_in') && f.value) s+=' '+f.value;
+    else if(needsValue(f.op) && f.value) s+=' „'+f.value+'“';
     lines.push(s);
   });
   const groups=readGroups();
-  if(groups.length) lines.push('Gruppiert nach: '+groups.join(', '));
+  if(groups.length) lines.push('Gruppiert nach: '+groups.map(groupLabel).join(', '));
   readAggs().forEach(function(a){
     if(a.fn==='count' && (!a.column || a.column==='*')) lines.push('Berechnet: Anzahl');
     else lines.push('Berechnet: '+aggLabel(a.fn)+' von '+a.column);
@@ -2152,6 +2379,14 @@ function suggestedQueries(){
   if(cols.indexOf('mitgliedsnummer')>=0){
     out.push({name:'Nach Mitgliedsnummer gruppiert', search:'', filters:[], groups:['mitgliedsnummer'], aggs:[{fn:'count',column:'*'}]});
   }
+  const amount=pickAmountCol();
+  if(amount && cols.indexOf('status')>=0){
+    out.push({name:'Summe nach Status', search:'', filters:[], groups:['status'], aggs:[{fn:'sum',column:amount}]});
+  }
+  const dateCol=cols.indexOf('created_at')>=0?'created_at':cols.filter(isDateishCol)[0];
+  if(dateCol){
+    out.push({name:'Summe nach Monat', search:'', filters:[], groups:[dateCol+':month'], aggs:amount?[{fn:'sum',column:amount}]:[{fn:'count',column:'*'}]});
+  }
   return out;
 }
 function fillSavedSelect(){
@@ -2202,6 +2437,8 @@ function snapshotQuery(){
     sql:sqlDirty?(document.getElementById('asql').value||''):'',
     date_from:document.getElementById('adatefrom').value||'',
     date_to:document.getElementById('adateto').value||'',
+    date_column:document.getElementById('adatecol').value||'',
+    date_grain:(document.getElementById('adategrain')&&document.getElementById('adategrain').value)||'day',
     note:document.getElementById('anote').value||''
   };
 }
@@ -2212,11 +2449,17 @@ function applyPreset(preset){
     return;
   }
   resetBuilder(true);
+  fillDateCols();
+  if(preset.date_grain && document.getElementById('adategrain')){
+    document.getElementById('adategrain').value=preset.date_grain;
+  }
+  syncDateGrain();
   document.getElementById('asearch').value=preset.search||'';
   document.getElementById('adatefrom').value=preset.date_from||'';
   document.getElementById('adateto').value=preset.date_to||'';
+  if(preset.date_column) document.getElementById('adatecol').value=preset.date_column;
   if(preset.note) document.getElementById('anote').value=preset.note;
-  (preset.filters||[]).forEach(function(f){ addFilter(f.column, f.op, f.value); });
+  (preset.filters||[]).forEach(function(f){ addFilter(f.column, f.op, f.value, f.value2); });
   (preset.groups||[]).forEach(function(c){ addGroup(c); });
   (preset.aggs||[]).forEach(function(a){ addAgg(a.fn, a.column==='*'?'':a.column); });
   analyzeOrder=preset.order||null;
@@ -2392,24 +2635,86 @@ function drawChart(d){
     ctx.fillText(ellipsizeCanvas(ctx, r.label, barW+8), x+barW/2, h-6);
   });
 }
-function exportBefund(){
-  if(!lastAnalyze){ alert('Keine Ergebnisse zum Export. Zuerst Anwenden.'); return; }
+function mdTable(cols, rows){
+  if(!cols||!cols.length) return [];
+  const out=['| '+cols.join(' | ')+' |','| '+cols.map(function(){return '---';}).join(' | ')+' |'];
+  (rows||[]).forEach(function(row){
+    out.push('| '+cols.map(function(c){
+      return String(fmtVal(row[c])).replace(/\|/g,'\\|').replace(/\n/g,' ');
+    }).join(' | ')+' |');
+  });
+  return out;
+}
+function readAkte(){
+  try{ return JSON.parse(localStorage.getItem('analyzeAkte')||'[]')||[]; }
+  catch(e){ return []; }
+}
+function writeAkte(items){
+  try{ localStorage.setItem('analyzeAkte', JSON.stringify(items)); }catch(e){}
+  renderAkteHint();
+}
+function renderAkteHint(){
+  const el=document.getElementById('aktehint');
+  if(!el) return;
+  const n=readAkte().length;
+  if(!n){ el.textContent='Akte leer'; return; }
+  el.innerHTML=n+' in der Akte <button class="act" type="button" onclick="clearAkte()">Leeren</button>';
+}
+function addToAkte(){
+  if(!lastAnalyze){ alert('Keine Ergebnisse. Zuerst Anwenden.'); return; }
   const cols=visibleCols(lastAnalyze.columns||[]);
-  const rows=lastAnalyze.rows||[];
+  const rows=(lastAnalyze.rows||[]).slice(0,40).map(function(row){
+    const slim={};
+    cols.forEach(function(c){ slim[c]=row[c]; });
+    return slim;
+  });
+  const items=readAkte();
+  items.push({
+    t:Date.now(),
+    folder:currentFolder(),
+    table:selectedTable&&selectedTable.display,
+    note:(document.getElementById('anote').value||'').trim(),
+    lines:queryCaptionLines(),
+    cols:cols,
+    rows:rows,
+    total:lastAnalyze.total||0,
+    more:(lastAnalyze.total||0)>rows.length
+  });
+  if(items.length>30) items.splice(0, items.length-30);
+  writeAkte(items);
+}
+function clearAkte(){
+  if(!readAkte().length) return;
+  if(!confirm('Befund-Akte leeren?')) return;
+  writeAkte([]);
+}
+function exportBefund(){
+  if(!lastAnalyze && !readAkte().length){ alert('Keine Ergebnisse zum Export. Zuerst Anwenden oder etwas zur Akte legen.'); return; }
   const md=['# Königssturz – Befund',''];
-  queryCaptionLines().forEach(function(l){ md.push('- '+l); });
-  md.push('','## Daten','');
-  if(cols.length){
-    md.push('| '+cols.join(' | ')+' |');
-    md.push('| '+cols.map(function(){return '---';}).join(' | ')+' |');
-    rows.forEach(function(row){
-      md.push('| '+cols.map(function(c){
-        return String(fmtVal(row[c])).replace(/\|/g,'\\|').replace(/\n/g,' ');
-      }).join(' | ')+' |');
+  const akte=readAkte();
+  if(akte.length){
+    md.push('Akte mit '+akte.length+(akte.length===1?' Eintrag.':' Einträgen.'),'');
+    akte.forEach(function(item,i){
+      const when=item.t?new Date(item.t).toLocaleString('de-DE'):'';
+      md.push('## '+(i+1)+'. '+(item.table||'Tabelle')+(when?' ('+when+')':''),'');
+      (item.lines||[]).forEach(function(l){ md.push('- '+l); });
+      if(item.note) md.push('- Notiz: '+item.note);
+      md.push('');
+      mdTable(item.cols||[], item.rows||[]).forEach(function(l){ md.push(l); });
+      if(item.more) md.push('','Nur die gespeicherte Seite. Alle Zeilen: JSON oder CSV exportieren.');
+      md.push('');
     });
   }
-  if((lastAnalyze.total||0)>rows.length){
-    md.push('','Nur die aktuelle Seite. Alle Zeilen: JSON oder CSV exportieren.');
+  if(lastAnalyze){
+    const cols=visibleCols(lastAnalyze.columns||[]);
+    const rows=lastAnalyze.rows||[];
+    md.push(akte.length?'## Aktuelle Ansicht':'## Daten','');
+    queryCaptionLines().forEach(function(l){ md.push('- '+l); });
+    md.push('');
+    mdTable(cols, rows).forEach(function(l){ md.push(l); });
+    if((lastAnalyze.total||0)>rows.length){
+      md.push('','Nur die aktuelle Seite. Alle Zeilen: JSON oder CSV exportieren.');
+    }
   }
   const stamp=new Date().toISOString().slice(0,19).replace(/[:T]/g,'-');
   const name=(selectedTable&&selectedTable.display||'befund').replace(/[^\w.\-]+/g,'_')+'_befund_'+stamp+'.md';
@@ -2444,6 +2749,7 @@ function initSplit(){
   });
 }
 initSplit();
+renderAkteHint();
 </script>
 </body></html>
 """

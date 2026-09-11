@@ -26,17 +26,25 @@ JSON_SUFFIX = ".json"
 FILTER_OPS = (
     "eq",
     "ne",
+    "in",
+    "not_in",
     "contains",
     "not_contains",
     "starts",
     "empty",
     "not_empty",
     "gt",
+    "gte",
     "lt",
+    "lte",
+    "between",
 )
+LIST_SPLIT_RE = re.compile(r"[\n,;]+")
 AGG_FNS = ("count", "sum", "avg", "min", "max")
 IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+MONTH_RE = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
+DATETIME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}[T t]\d{2}:\d{2}")
 FK_RE = re.compile(
     r"FOREIGN KEY\s*\(\s*\"?([A-Za-z_][A-Za-z0-9_]*)\"?\s*\)\s*"
     r"REFERENCES\s+\"?([A-Za-z_][A-Za-z0-9_.]*)\"?\s*"
@@ -217,15 +225,16 @@ def build_sql(
     relation_sql = quote_ident(relation)
     col_set = set(columns)
     where_sql = _where_sql(columns, search, filters or [], date_from, date_to, date_column)
-    groups = [_require_column(c, col_set) for c in (group_by or []) if str(c).strip()]
+    parsed_groups = _parse_groups(group_by or [], col_set)
+    group_aliases = [alias for _expr, alias in parsed_groups]
     aggs = [a for a in (aggregations or []) if a]
-    select_sql, grouped = _select_sql(columns, groups, aggs)
+    select_sql, grouped = _select_sql(columns, parsed_groups, aggs)
     sql = "SELECT %s\nFROM %s" % (select_sql, relation_sql)
     if where_sql:
         sql += "\nWHERE %s" % where_sql
-    if grouped and groups:
-        sql += "\nGROUP BY %s" % ", ".join(str(i) for i in range(1, len(groups) + 1))
-    order_sql = _order_sql(order, col_set, groups, aggs, grouped)
+    if grouped and parsed_groups:
+        sql += "\nGROUP BY %s" % ", ".join(str(i) for i in range(1, len(parsed_groups) + 1))
+    order_sql = _order_sql(order, col_set, group_aliases, aggs, grouped)
     if order_sql:
         sql += "\nORDER BY %s" % order_sql
     return sql
@@ -527,7 +536,7 @@ def export_compare_bytes(
     if data["total"] > len(data["rows"]):
         stem += "_teil"
     columns = data["columns"]
-    rows = data["rows"]
+    rows = [{k: v for k, v in row.items() if k != "_chg"} for row in data["rows"]]
     if kind == "csv":
         return _to_csv(columns, rows), "%s_vergleich.csv" % stem, "text/csv; charset=utf-8"
     payload = json.dumps(
@@ -865,6 +874,11 @@ def _where_sql(
             parts.append("CAST(%s AS VARCHAR) = %s" % (qcol, sql_literal(text)))
         elif op == "ne":
             parts.append("CAST(%s AS VARCHAR) <> %s" % (qcol, sql_literal(text)))
+        elif op in ("in", "not_in"):
+            items = _filter_list(value, text)
+            lits = ", ".join(sql_literal(item) for item in items)
+            kw = "IN" if op == "in" else "NOT IN"
+            parts.append("CAST(%s AS VARCHAR) %s (%s)" % (qcol, kw, lits))
         elif op == "contains":
             parts.append(
                 "CAST(%s AS VARCHAR) ILIKE %s ESCAPE '\\'"
@@ -880,21 +894,113 @@ def _where_sql(
                 "CAST(%s AS VARCHAR) ILIKE %s ESCAPE '\\'"
                 % (qcol, sql_literal(_escape_like(text) + "%"))
             )
-        elif op in ("gt", "lt"):
-            cmp_op = ">" if op == "gt" else "<"
-            lit = sql_literal(text)
-            num = "TRY_CAST(%s AS DOUBLE)" % qcol
-            nval = "TRY_CAST(%s AS DOUBLE)" % lit
+        elif op in ("gt", "gte", "lt", "lte"):
+            parts.append(_cmp_sql(qcol, op, text))
+        elif op == "between":
+            other = item.get("value2")
+            end = "" if other is None else str(other)
+            if not text.strip() or not end.strip():
+                raise AnalyzeError("„zwischen“ braucht zwei Werte (von und bis).")
             parts.append(
-                "(CASE WHEN %s IS NOT NULL AND %s IS NOT NULL THEN %s %s %s "
-                "ELSE CAST(%s AS VARCHAR) %s %s END)"
-                % (num, nval, num, cmp_op, nval, qcol, cmp_op, lit)
+                "(%s AND %s)" % (_cmp_sql(qcol, "gte", text), _cmp_sql(qcol, "lte", end))
             )
     return " AND ".join(parts)
 
 
 def _escape_like(text: str) -> str:
     return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _filter_list(value: Any, text: str) -> list[str]:
+    if isinstance(value, (list, tuple)):
+        items = [str(item).strip() for item in value if str(item).strip()]
+    else:
+        items = [part.strip() for part in LIST_SPLIT_RE.split(text or "") if part.strip()]
+    if not items:
+        raise AnalyzeError("Die Werteliste ist leer.")
+    if len(items) > 80:
+        raise AnalyzeError("Höchstens 80 Werte in der Liste.")
+    return items
+
+
+def _bound_kind(text: str) -> tuple[str, str]:
+    t = (text or "").strip()
+    if MONTH_RE.match(t):
+        return "month", t
+    if DATE_RE.match(t):
+        return "day", t
+    if DATETIME_RE.match(t):
+        return "datetime", t
+    return "raw", t
+
+
+def _looks_temporal(text: str) -> bool:
+    return _bound_kind(text)[0] in ("month", "day", "datetime")
+
+
+def _sql_ts_start(text: str) -> str:
+    kind, t = _bound_kind(text)
+    if kind == "month":
+        return "TIMESTAMP %s" % sql_literal(t + "-01")
+    if kind == "day":
+        return "TIMESTAMP %s" % sql_literal(t)
+    return "TRY_CAST(%s AS TIMESTAMP)" % sql_literal(t)
+
+
+def _sql_ts_after(text: str) -> Optional[str]:
+    kind, t = _bound_kind(text)
+    if kind == "month":
+        year, month = int(t[:4]), int(t[5:7])
+        if month == 12:
+            nxt = "%04d-01-01" % (year + 1)
+        else:
+            nxt = "%04d-%02d-01" % (year, month + 1)
+        return "TIMESTAMP %s" % sql_literal(nxt)
+    if kind == "day":
+        return "TIMESTAMP %s + INTERVAL '1 day'" % sql_literal(t)
+    return None
+
+
+def _cmp_sql(qcol: str, op: str, text: str) -> str:
+    value = (text or "").strip()
+    if not value:
+        raise AnalyzeError("Vergleich ohne Wert.")
+    ts = "TRY_CAST(%s AS TIMESTAMP)" % qcol
+    num = "TRY_CAST(%s AS DOUBLE)" % qcol
+    lit = sql_literal(value)
+    nval = "TRY_CAST(%s AS DOUBLE)" % lit
+    tsv = "TRY_CAST(%s AS TIMESTAMP)" % lit
+    start = _sql_ts_start(value)
+    after = _sql_ts_after(value)
+    if op == "gte":
+        ts_pred = "%s >= %s" % (ts, start)
+        num_pred = "%s >= %s" % (num, nval)
+        str_pred = "CAST(%s AS VARCHAR) >= %s" % (qcol, lit)
+    elif op == "gt":
+        ts_pred = "%s >= %s" % (ts, after) if after else "%s > %s" % (ts, tsv)
+        num_pred = "%s > %s" % (num, nval)
+        str_pred = "CAST(%s AS VARCHAR) > %s" % (qcol, lit)
+    elif op == "lte":
+        ts_pred = "%s < %s" % (ts, after) if after else "%s <= %s" % (ts, tsv)
+        num_pred = "%s <= %s" % (num, nval)
+        str_pred = "CAST(%s AS VARCHAR) <= %s" % (qcol, lit)
+    elif op == "lt":
+        ts_pred = "%s < %s" % (ts, start)
+        num_pred = "%s < %s" % (num, nval)
+        str_pred = "CAST(%s AS VARCHAR) < %s" % (qcol, lit)
+    else:
+        raise AnalyzeError("Unbekannter Vergleich: %s" % op)
+    if _looks_temporal(value):
+        ts_ok = "%s IS NOT NULL" % ts
+        if op in ("gt", "lte") and not after:
+            ts_ok = "%s IS NOT NULL AND %s IS NOT NULL" % (ts, tsv)
+        elif op in ("gte", "lt") and _bound_kind(value)[0] == "datetime":
+            ts_ok = "%s IS NOT NULL AND %s IS NOT NULL" % (ts, start)
+        return "(CASE WHEN %s THEN %s ELSE FALSE END)" % (ts_ok, ts_pred)
+    return (
+        "(CASE WHEN %s IS NOT NULL AND %s IS NOT NULL THEN %s ELSE %s END)"
+        % (num, nval, num_pred, str_pred)
+    )
 
 
 def _pick_date_column(columns: list[str], requested: str = "") -> str:
@@ -917,35 +1023,69 @@ def _date_where_sql(columns: list[str], date_from: str, date_to: str, date_colum
     end = (date_to or "").strip()
     if not start and not end:
         return ""
-    if start and not DATE_RE.match(start):
-        raise AnalyzeError("Datum von muss JJJJ-MM-TT sein.")
-    if end and not DATE_RE.match(end):
-        raise AnalyzeError("Datum bis muss JJJJ-MM-TT sein.")
+    if start and not _looks_temporal(start):
+        raise AnalyzeError("Datum von muss JJJJ-MM oder JJJJ-MM-TT sein.")
+    if end and not _looks_temporal(end):
+        raise AnalyzeError("Datum bis muss JJJJ-MM oder JJJJ-MM-TT sein.")
     col = _pick_date_column(columns, date_column)
     if not col:
         raise AnalyzeError("Keine Datumsspalte gefunden. created_at oder eine *_at-Spalte wird erwartet.")
     qcol = "TRY_CAST(%s AS TIMESTAMP)" % quote_ident(col)
     parts = []
     if start:
-        parts.append("%s >= TIMESTAMP %s" % (qcol, sql_literal(start)))
+        parts.append("%s >= %s" % (qcol, _sql_ts_start(start)))
     if end:
-        parts.append("%s < TIMESTAMP %s + INTERVAL '1 day'" % (qcol, sql_literal(end)))
+        after = _sql_ts_after(end)
+        if after:
+            parts.append("%s < %s" % (qcol, after))
+        else:
+            parts.append("%s <= TRY_CAST(%s AS TIMESTAMP)" % (qcol, sql_literal(end)))
     return " AND ".join(parts)
 
 
+def _parse_groups(group_by: list[Any], col_set: set[str]) -> list[tuple[str, str]]:
+    out = []
+    used: set[str] = set()
+    for item in group_by:
+        raw = str(item or "").strip()
+        if not raw:
+            continue
+        if raw.endswith(":month"):
+            col = _require_column(raw[:-6], col_set)
+            alias = "monat" if "monat" not in used else "monat_" + col
+            n = 2
+            base = alias
+            while alias in used or not IDENT_RE.match(alias):
+                alias = "%s_%s" % (base, n)
+                n += 1
+            used.add(alias)
+            expr = "strftime(date_trunc('month', TRY_CAST(%s AS TIMESTAMP)), '%s')" % (
+                quote_ident(col),
+                "%Y-%m",
+            )
+            out.append((expr, alias))
+            continue
+        col = _require_column(raw, col_set)
+        used.add(col)
+        out.append((quote_ident(col), col))
+    return out
+
+
 def _select_sql(
-    columns: list[str], groups: list[str], aggs: list[dict[str, Any]]
+    columns: list[str],
+    groups: list[tuple[str, str]],
+    aggs: list[dict[str, Any]],
 ) -> tuple[str, bool]:
     if not groups and not aggs:
         if columns:
             return ", ".join(quote_ident(c) for c in columns), False
         return "*", False
-    pieces = [quote_ident(c) for c in groups]
+    pieces = ["%s AS %s" % (expr, quote_ident(alias)) for expr, alias in groups]
     if not aggs:
         pieces.append("COUNT(*) AS %s" % quote_ident("anzahl"))
         return ", ".join(pieces), True
     col_set = set(columns)
-    used = set(groups)
+    used = set(alias for _expr, alias in groups)
     for agg in aggs:
         fn = str(agg.get("fn") or "").strip().lower()
         if fn not in AGG_FNS:
@@ -1366,12 +1506,16 @@ def _compare_view(
     row["Schlüssel"] = _fmt_key(key, pk)
     if kind == "geändert":
         parts = []
+        changed = {}
         for col in cols:
             a = (old or {}).get(col)
             b = (new or {}).get(col)
             if _norm_val(a) != _norm_val(b):
-                parts.append("%s: %s → %s" % (col, fmt_short(a), fmt_short(b)))
+                alt, neu = fmt_short(a), fmt_short(b)
+                parts.append("%s: %s → %s" % (col, alt, neu))
+                changed[col] = {"alt": alt, "neu": neu}
         row["Diff"] = "; ".join(parts)
+        row["_chg"] = changed
     elif kind == "neu":
         row["Diff"] = "nur in neuerer Sicherung"
     elif kind == "gelöscht":

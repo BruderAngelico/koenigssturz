@@ -52,8 +52,9 @@ Oben den Backup-Ordner wählen (Standard: der neueste). Links die Tabellen, rech
 ### Suchen und filtern
 
 - **Suche** durchsucht alle Spalten der gewählten Tabelle.
-- **Nur Zeilen wo** setzt Bedingungen (ist, enthält, leer, größer als, …). Nach Wahl der Spalte schlägt das Wertfeld häufige Einträge vor, etwa Status `Offen` / `Gebucht`.
-- **Datum von / bis** filtert über `created_at`, falls vorhanden, sonst die nächste Zeitspalte (`updated_at`, `*_at`, `*_date`). Format im Kalenderfeld, Grenzen einschließlich.
+- **Nur Zeilen wo** setzt Bedingungen (ist, enthält, ist einer von, leer, größer gleich, zwischen, …). Nach Wahl der Spalte schlägt das Wertfeld häufige Einträge vor. **ist einer von** nimmt mehrere Werte mit Komma. Klick auf eine Zelle öffnet die Vorschau mit **Als Filter**; Umschalt+Klick setzt den Filter direkt. Ein zweiter Klick auf dieselbe Spalte sammelt die Werte in „ist einer von“.
+- **Zeitraum von / bis** filtert eine wählbare Datumsspalte (Tag oder Monat). **Summe** gruppiert nach Monat und summiert `total_amount` (sonst Anzahl). In **Gruppiere nach** gibt es dafür auch `Spalte (Monat)`.
+- **Zur Akte** merkt die aktuelle Ansicht. **Befund** schreibt sie als Markdown; liegen Einträge in der Akte, stehen sie alle in derselben Datei.
 - **Gruppiere nach** und **Berechne** (Anzahl, Summe, …) erzeugen Verdichtungen. Darunter erscheint ein Balkendiagramm für Anzahl oder Summe.
 - **SQL anzeigen/bearbeiten** zeigt das erzeugte `SELECT`. Wer den Text ändert, führt genau dieses SELECT aus. Mehrere Anweisungen, Kommentare und Dateizugriffe sind gesperrt.
 - Spaltenköpfe sortieren aufsteigend/absteigend.
@@ -70,7 +71,7 @@ Unter **Vergleich mit** den zweiten Ordner wählen.
 - **Tabelle vergleichen** braucht eine Tabelle links. Es zeigt Zeilen, die nur links, nur rechts oder in beiden mit anderem Inhalt vorkommen. Grundlage ist der Primary Key aus dem Schema, sonst `id`.
 - **Ordner vergleichen** braucht keine Tabelle: welche Tabellen neu, verschwunden oder in der Zeilenzahl anders sind. Ein Klick auf den Tabellennamen öffnet sie und startet den Zeilenvergleich.
 
-Neu / gelöscht / geändert / gleich lassen sich ankreuzen. Farben: grün neu, rot gelöscht, beige geändert.
+Neu / gelöscht / geändert / gleich lassen sich ankreuzen. Farben: grün neu, rot gelöscht, beige geändert. Bei geänderten Zeilen sind die abweichenden Felder fett unterstrichen; der Tooltip zeigt alt → neu.
 
 ### Verwandte Zeilen
 
@@ -80,7 +81,7 @@ Zellen mit IDs, `mitgliedsnummer`, `invoice_id` und echten Foreign Keys aus dem 
 
 - **Spalten** blendet Felder aus (bleibt im Browser gespeichert, gilt auch für PNG).
 - **Abfrage** speichert die aktuelle Kombination aus Suche, Filter, Datum, Gruppe und SQL unter einem Namen. Zu Tabellen mit `status` oder `mitgliedsnummer` gibt es fertige Vorschläge.
-- **Notiz zum Befund** ist Freitext. Sie steht oben in der PNG und im Befund-Export.
+- **Notiz zum Befund** ist Freitext. Sie steht oben in der PNG und im Befund-Export. **Zur Akte** legt die aktuelle Ansicht ab; **Befund** schreibt die ganze Akte plus die aktuelle Ansicht.
 
 ### Export
 
@@ -89,7 +90,7 @@ Zellen mit IDs, `mitgliedsnummer`, `invoice_id` und echten Foreign Keys aus dem 
 | JSON   | Alle Treffer der aktuellen Abfrage oder des Vergleichs (bis 100 000 Zeilen) |
 | CSV    | Dasselbe, UTF-8 mit BOM, öffnet sich in Excel |
 | PNG    | Bild mit Ordner, Tabelle, Filtern, Notiz und der sichtbaren Tabelle. Nur wenn alles auf **eine Seite** passt (max. 40 Zeilen, 16 Spalten) |
-| Befund | Markdown-Datei mit denselben Angaben plus Tabelle, zum Weitergeben oder Ablegen |
+| Befund | Markdown mit Notiz, Abfrage, sichtbarer Tabelle. Liegt etwas in der Akte, stehen alle Einträge in einer Datei. |
 
 PNG und Befund nutzen die **sichtbaren** Spalten.
 

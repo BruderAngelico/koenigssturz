@@ -18,13 +18,22 @@ from typing import Any, Dict
 import imaplib
 import requests
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import HTMLResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, Response
 
 import kingfall as kf
 import kingfall_analyze as ka
+import kingfall_vereinsarchiv as va
 
 HOST = "127.0.0.1"
 PORT_CANDIDATES = (18765, 18080, 19000, 8088, 8000, 8765)
+VA_AUDIO_TYPES = {
+    ".aac": "audio/aac",
+    ".m4a": "audio/mp4",
+    ".mp3": "audio/mpeg",
+    ".ogg": "audio/ogg",
+    ".wav": "audio/wav",
+    ".webm": "audio/webm",
+}
 
 
 def _port_from_args():
@@ -108,6 +117,16 @@ class WebState:
         self.count_table_index = 0
         self.stop = False
         self.mail_stop = False
+        self.va_curl = ""
+        self.va_headers = {}
+        self.va_auth = kf.AuthSession()
+        self.va_base = ""
+        self.va_status = "Bereit"
+        self.va_error = ""
+        self.va_running = False
+        self.va_stop = False
+        self.va_progress = {}
+        self.va_local_rev = 0
         threading.Thread(target=self._watchdog, daemon=True).start()
 
     def snapshot(self):
@@ -152,6 +171,12 @@ class WebState:
                 "browse_label": browse_label,
                 "browse_page": self.browse_page,
                 "phase": self.phase,
+                "va_status": self.va_status,
+                "va_error": self.va_error,
+                "va_running": self.va_running,
+                "va_progress": dict(self.va_progress),
+                "va_token_status": self._va_token_status(),
+                "va_local_rev": self.va_local_rev,
             }
 
     def _bar(self, exported, total, status):
@@ -239,6 +264,124 @@ class WebState:
         self.db_error = ""
         left = int(max(0, self.auth.seconds_left()))
         self.db_status = "cURL übernommen · Token noch ca. %s min" % max(1, left // 60) if left else "cURL übernommen"
+
+    def _va_token_status(self):
+        if not self.va_auth.access_token:
+            return "Kein Token"
+        left = self.va_auth.seconds_left()
+        if left < 20:
+            return "Token abgelaufen"
+        return "Token noch ca. %s min" % max(1, int(left) // 60)
+
+    def set_va_curl(self, curl):
+        url, headers = kf.parse_curl(curl)
+        self.va_curl = curl
+        auth = kf.AuthSession()
+        auth.ingest_headers(headers)
+        if not auth.access_token:
+            raise RuntimeError("Im cURL steckt kein Authorization-Token.")
+        left = auth.seconds_left()
+        if left < 20:
+            raise RuntimeError(
+                "Der Token ist abgelaufen. Bitte in den DevTools einen frischen Request kopieren."
+            )
+        auth.apply_to_headers(headers)
+        if not kf.header_value(headers, "origin"):
+            headers["Origin"] = va.VA_ORIGIN
+        self.va_auth = auth
+        self.va_headers = headers
+        self.va_base = va.base_from_url(url)
+        self.va_error = ""
+        self.va_status = "Token übernommen · noch ca. %s min gültig" % max(1, int(left) // 60)
+
+    def start_va_download(self, kinds, curl=""):
+        if curl and str(curl).strip():
+            self.set_va_curl(curl)
+        with self.lock:
+            if self.va_running:
+                raise RuntimeError("Es läuft bereits ein Vereinsarchiv-Download.")
+            if not self.va_auth.access_token:
+                raise RuntimeError("Zuerst einen cURL mit Token einfügen.")
+            if self.va_auth.seconds_left() < 20:
+                raise RuntimeError(
+                    "Der Token ist abgelaufen. Bitte in den DevTools einen frischen Request kopieren."
+                )
+            selected = [k for k in (kinds or []) if k in va.KINDS]
+            if not selected:
+                raise RuntimeError("Bitte öffentlich und/oder intern ankreuzen.")
+            self.va_stop = False
+            self.va_error = ""
+            self.va_progress = {}
+            self.va_running = True
+            self.va_status = "Starte Download …"
+        threading.Thread(target=self._va_job, args=(selected,), daemon=True).start()
+
+    def stop_va(self):
+        self.va_stop = True
+        self.va_status = "Stoppe …"
+
+    def _va_status_from_progress(self, info):
+        phase = info.get("phase")
+        current = info.get("current") or ""
+        if phase == "listing":
+            return current
+        return "Download %s/%s · %s (übersprungen %s, Fehler %s)" % (
+            info.get("done") or 0,
+            info.get("total") or 0,
+            current,
+            info.get("skipped") or 0,
+            info.get("failed") or 0,
+        )
+
+    def _va_job(self, kinds):
+        try:
+            with self.lock:
+                headers = dict(self.va_headers)
+                base = self.va_base
+                self.va_auth.apply_to_headers(headers)
+
+            def should_stop():
+                return self.va_stop
+
+            def on_progress(info):
+                with self.lock:
+                    self.va_progress = dict(info)
+                    self.va_status = self._va_status_from_progress(info)
+                    if info.get("saved"):
+                        self.va_local_rev += 1
+
+            stats = va.download_kinds(
+                base,
+                headers,
+                kinds,
+                should_stop=should_stop,
+                progress_cb=on_progress,
+            )
+            saved = (stats.get("done") or 0) - (stats.get("skipped") or 0)
+            errors = stats.get("errors") or []
+            with self.lock:
+                if self.va_stop:
+                    self.va_status = "Abgebrochen · %s/%s" % (
+                        stats.get("done") or 0,
+                        stats.get("total") or 0,
+                    )
+                else:
+                    self.va_status = "Fertig · %s neu, %s schon da, %s Fehler" % (
+                        saved,
+                        stats.get("skipped") or 0,
+                        stats.get("failed") or 0,
+                    )
+                self.va_error = "\n".join(errors[:8])
+                self.va_progress = dict(stats)
+                self.va_progress.pop("errors", None)
+        except Exception as exc:
+            with self.lock:
+                self.va_status = "Fehler"
+                self.va_error = str(exc)
+        finally:
+            with self.lock:
+                self.va_running = False
+                self.va_local_rev += 1
 
     def login(self, email, password, totp):
         if self.curl.strip():
@@ -953,7 +1096,18 @@ textarea.paused{background:#fff4cc;}
 .pager{display:flex;align-items:center;gap:12px;padding-top:8px;}
 #mail{min-height:0;}
 #db{min-height:0;}
+#va{min-height:0;}
 #analyze{min-height:0;}
+#vacurl{min-height:90px;}
+#valist .head,#valist .rowl{grid-template-columns:88px 1.6fr 72px 44px 52px;}
+#valist .rowl span:nth-child(2){overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+#vabody h2{margin:0 0 4px;font-size:16px;}
+#vabody h3{margin:14px 0 6px;font-size:13px;}
+#va .agrid .list{flex:1;min-height:0;}
+.vaplayer{flex:0 0 auto;background:var(--bg);border-top:1px solid #c4bfb4;padding:8px 0 0;}
+.vaplayer audio{width:100%;}
+#vatx .tx{display:grid;grid-template-columns:64px 130px 1fr;gap:6px 10px;font-size:12px;padding:4px 0;border-bottom:1px solid #eee;cursor:pointer;}
+#vatx .tx:hover{background:var(--hover);}
 .bottom{flex:1;display:flex;flex-direction:column;min-height:180px;}
 .split{display:flex;flex:1;min-height:0;gap:0;}
 .tlist{flex:0 0 280px;width:280px;min-width:180px;max-width:70%;display:flex;flex-direction:column;}
@@ -1019,6 +1173,7 @@ table.data td.jump{cursor:pointer;text-decoration:underline dotted;}
 <div class="tabs">
   <button id="bdb" class="on" onclick="tab('db')">Supabase</button>
   <button id="bmail" onclick="tab('mail')">E-Mail (IONOS)</button>
+  <button id="bva" onclick="tab('va')">Vereinsarchiv</button>
   <button id="banalyze" onclick="tab('analyze')">Auswertung</button>
 </div>
 
@@ -1101,6 +1256,59 @@ table.data td.jump{cursor:pointer;text-decoration:underline dotted;}
       <button class="act" onclick="post('/api/mail/page',{delta:-1})">Zurück</button>
       <span id="browselabel">Keine Mails</span>
       <button class="act" onclick="post('/api/mail/page',{delta:1})">Weiter</button>
+    </div>
+  </fieldset>
+</section>
+
+<section class="pane" id="va">
+  <fieldset>
+    <legend> 1. Token (cURL) </legend>
+    <p class="hint">Login geht nur per Magic-Link. In den DevTools einen Request von vereinsarchiv-vorstand.pages.dev als cURL kopieren und hier einfügen. Der Token steht unter Authorization. Nicht den Königssturz-cURL verwenden.</p>
+    <textarea id="vacurl" placeholder="cURL hier einfügen"></textarea>
+    <div class="inline">
+      <button class="act" onclick="post('/api/va/curl',{curl:gv('vacurl')})">Token übernehmen</button>
+      <span class="status" id="vatoken">Kein Token</span>
+    </div>
+  </fieldset>
+  <fieldset>
+    <legend> 2. Stammtische sichern </legend>
+    <p class="hint">Schon vollständige Stammtische (JSON und Audio) werden übersprungen. Kein Zeitstempel-Ordner – alles landet in vereinsarchiv/.</p>
+    <div class="inline">
+      <label><input type="checkbox" id="vakindpublic" checked> Öffentlich</label>
+      <label><input type="checkbox" id="vakindintern" checked> Intern</label>
+      <button class="act" id="btnVaDl" onclick="vaDownload()">Download</button>
+      <button class="act" id="btnVaStop" onclick="post('/api/va/stop',{})">Stop</button>
+      <span class="status" id="vastatus">Status: Bereit</span>
+    </div>
+    <div class="err" id="vaerr"></div>
+  </fieldset>
+  <fieldset class="bottom">
+    <legend> 3. Lokal browsen </legend>
+    <div class="inline">
+      <label for="vafilter">Quelle</label>
+      <select id="vafilter" onchange="renderVaList()">
+        <option value="all">Alle</option>
+        <option value="public">Öffentlich</option>
+        <option value="intern">Intern</option>
+      </select>
+      <label for="vasearch">Suche</label>
+      <input id="vasearch" type="text" oninput="renderVaList()" placeholder="Titel, Thema, Datum"/>
+      <span class="status" id="vahint">Noch keine Stammtische lokal</span>
+    </div>
+    <div class="split">
+      <div class="tlist" id="valistbox">
+        <div class="list" id="valist">
+          <div class="head"><span>Datum</span><span>Titel</span><span>Quelle</span><span>Audio</span><span>Dauer</span></div>
+          <div id="varows"></div>
+        </div>
+      </div>
+      <div class="splitbar" id="vasplitbar"></div>
+      <div class="agrid">
+        <div class="list" id="vabody"></div>
+        <div class="vaplayer" id="vaplayer" style="display:none">
+          <audio id="vaaudio" controls></audio>
+        </div>
+      </div>
     </div>
   </fieldset>
 </section>
@@ -1243,11 +1451,14 @@ table.data td.jump{cursor:pointer;text-decoration:underline dotted;}
 function tab(name){
   document.getElementById('db').className='pane'+(name==='db'?' on':'');
   document.getElementById('mail').className='pane'+(name==='mail'?' on':'');
+  document.getElementById('va').className='pane'+(name==='va'?' on':'');
   document.getElementById('analyze').className='pane'+(name==='analyze'?' on':'');
   document.getElementById('bdb').className=name==='db'?'on':'';
   document.getElementById('bmail').className=name==='mail'?'on':'';
+  document.getElementById('bva').className=name==='va'?'on':'';
   document.getElementById('banalyze').className=name==='analyze'?'on':'';
   if(name==='analyze') loadBackups(false);
+  if(name==='va') loadVaLocal(false);
 }
 function gv(id){return document.getElementById(id).value;}
 function mailCreds(){return {user:gv('muser'),password:gv('mpass'),host:gv('mhost'),port:gv('mport')};}
@@ -1293,6 +1504,9 @@ function fmt(n){return (n===null||n===undefined||n==='?')?'?':String(n);}
 let lastSchemaNames='';
 let lastFolderNames='';
 let rec={};
+let lastVaRev=-1;
+let vaItems=[];
+let vaOpen=null;
 async function tick(){
   const s=await (await fetch('/api/state')).json();
   document.getElementById('loginstatus').textContent=s.login_status||'Kein Auto-Refresh';
@@ -1348,8 +1562,127 @@ async function tick(){
   document.getElementById('mailrows').innerHTML=(s.browse||[]).map(function(m){
     return '<div class="rowl"><span>'+esc(m.folder)+'</span><span>'+esc(m.from)+'</span><span>'+esc(m.to)+'</span><span>'+esc(m.subject)+'</span><span>'+esc(m.date)+'</span><span>'+sizeTxt(m.size)+'</span></div>';
   }).join('');
+  document.getElementById('vatoken').textContent=s.va_token_status||'Kein Token';
+  document.getElementById('vastatus').textContent='Status: '+(s.va_status||'Bereit');
+  document.getElementById('vaerr').textContent=s.va_error||'';
+  document.getElementById('btnVaDl').disabled=!!s.va_running;
+  document.getElementById('btnVaStop').disabled=!s.va_running;
+  if((s.va_local_rev||0)!==lastVaRev){
+    lastVaRev=s.va_local_rev||0;
+    loadVaLocal(true);
+  }
 }
 setInterval(tick,1000); tick();
+
+function vaKinds(){
+  const kinds=[];
+  if(document.getElementById('vakindpublic').checked) kinds.push('public');
+  if(document.getElementById('vakindintern').checked) kinds.push('intern');
+  return kinds;
+}
+function vaDownload(){
+  const kinds=vaKinds();
+  if(!kinds.length){ alert('Bitte öffentlich und/oder intern ankreuzen.'); return; }
+  post('/api/va/download',{kinds:kinds,curl:gv('vacurl')});
+}
+function vaDur(n){
+  n=parseInt(n,10);
+  if(isNaN(n)||n<0) return '–';
+  const h=Math.floor(n/3600);
+  const m=Math.floor((n%3600)/60);
+  const s=n%60;
+  const ss=String(s).padStart(2,'0');
+  if(h) return h+':'+String(m).padStart(2,'0')+':'+ss;
+  return m+':'+ss;
+}
+function vaKindLabel(kind){
+  return kind==='intern'?'Intern':'Öffentlich';
+}
+async function loadVaLocal(quiet){
+  try{
+    const r=await fetch('/api/va/local');
+    const d=await r.json().catch(function(){return [];});
+    vaItems=Array.isArray(d)?d:[];
+    renderVaList();
+  }catch(e){
+    if(!quiet) alert('Lokale Liste nicht lesbar.');
+  }
+}
+function renderVaList(){
+  const filter=document.getElementById('vafilter').value;
+  const q=(document.getElementById('vasearch').value||'').toLowerCase().trim();
+  const rows=vaItems.filter(function(it){
+    if(filter!=='all' && it.kind!==filter) return false;
+    if(!q) return true;
+    const hay=((it.titel||'')+' '+(it.datum||'')+' '+(it.ort||'')+' '+((it.themen||[]).join(' '))).toLowerCase();
+    return hay.indexOf(q)>=0;
+  });
+  document.getElementById('vahint').textContent=rows.length?(rows.length+' Stammtische'):'Noch keine Stammtische lokal';
+  document.getElementById('varows').innerHTML=rows.map(function(it){
+    const on=vaOpen&&vaOpen.kind===it.kind&&vaOpen.id===it.id?' on':'';
+    return '<button type="button" class="rowl'+on+'" data-kind="'+escAttr(it.kind)+'" data-id="'+escAttr(it.id)+'"><span>'+esc(it.datum||'')+'</span><span>'+esc(it.titel||it.id||'')+'</span><span>'+esc(vaKindLabel(it.kind))+'</span><span>'+(it.has_audio?'ja':'–')+'</span><span>'+vaDur(it.dauer_sek)+'</span></button>';
+  }).join('');
+}
+async function openVa(kind, id){
+  if(!kind||!id) return;
+  vaOpen={kind:kind,id:id};
+  renderVaList();
+  const r=await fetch('/api/va/item?kind='+encodeURIComponent(kind)+'&id='+encodeURIComponent(id));
+  const d=await r.json().catch(function(){return {};});
+  if(!r.ok){ alert(d.detail||d.error||'Nicht gefunden'); return; }
+  renderVaDetail(d);
+}
+function vaBlock(title, html){
+  if(!html) return '';
+  return '<h3>'+esc(title)+'</h3>'+html;
+}
+function renderVaDetail(item){
+  const z=item.zusammenfassung||{};
+  const sprecher=item.sprecher||[];
+  const themen=(item.themen||[]).join(', ');
+  let html='<h2>'+esc(item.titel||item.id||'')+'</h2>';
+  html+='<p class="hint">'+esc(vaKindLabel(item.kind))+' · '+esc(item.datum||'')+(item.ort?' · '+esc(item.ort):'')+' · '+vaDur(item.dauer_sek)+(themen?' · '+esc(themen):'')+'</p>';
+  if(z.lead) html+=vaBlock('Kurzfassung','<p>'+esc(z.lead)+'</p>');
+  if(z.fragen&&z.fragen.length){
+    html+=vaBlock('Fragen', z.fragen.map(function(q){
+      return '<p><strong>'+esc(q.frage||'')+'</strong><br>'+esc(q.antwort||'')+'</p>';
+    }).join(''));
+  }
+  if(z.aufgaben&&z.aufgaben.length){
+    html+=vaBlock('Aufgaben', z.aufgaben.map(function(a){
+      return '<p><strong>'+esc(a.wer||'')+':</strong> '+esc(a.text||'')+'</p>';
+    }).join(''));
+  }
+  if(z.sachstand&&z.sachstand.length){
+    html+=vaBlock('Sachstand','<ul>'+z.sachstand.map(function(s){return '<li>'+esc(s)+'</li>';}).join('')+'</ul>');
+  }
+  if(z.offene_fragen&&z.offene_fragen.length){
+    html+=vaBlock('Offene Fragen','<ul>'+z.offene_fragen.map(function(s){return '<li>'+esc(s)+'</li>';}).join('')+'</ul>');
+  }
+  if(item.transkript&&item.transkript.length){
+    html+=vaBlock('Transkript','<div id="vatx">'+item.transkript.map(function(t){
+      const name=sprecher[t.sp]!=null?sprecher[t.sp]:('Sprecher '+(t.sp==null?'?':t.sp));
+      return '<div class="tx" data-t="'+(t.t||0)+'"><span>'+vaDur(t.t)+'</span><span>'+esc(name)+'</span><span>'+esc(t.text||'')+'</span></div>';
+    }).join('')+'</div>');
+  }
+  document.getElementById('vabody').innerHTML=html;
+  const player=document.getElementById('vaaudio');
+  const wrap=document.getElementById('vaplayer');
+  if(item.has_audio){
+    wrap.style.display='block';
+    player.src='/api/va/audio/'+encodeURIComponent(item.kind)+'/'+encodeURIComponent(item.id);
+  }else{
+    wrap.style.display='none';
+    player.removeAttribute('src');
+  }
+}
+function seekVa(t){
+  const player=document.getElementById('vaaudio');
+  const n=parseFloat(t);
+  if(!player||isNaN(n)) return;
+  try{ player.currentTime=n; }catch(e){}
+  if(player.paused) player.play().catch(function(){});
+}
 
 const FILTER_OPS=[
   {id:'eq',label:'ist'},
@@ -2720,10 +3053,11 @@ function exportBefund(){
   const name=(selectedTable&&selectedTable.display||'befund').replace(/[^\w.\-]+/g,'_')+'_befund_'+stamp+'.md';
   downloadBlob(new Blob([md.join('\n')],{type:'text/markdown;charset=utf-8'}), name);
 }
-function initSplit(){
-  const bar=document.getElementById('splitbar');
-  const box=document.getElementById('tlistbox');
-  const saved=parseInt(localStorage.getItem('analyzeSplit')||'',10);
+function bindSplit(barId, boxId, storageKey){
+  const bar=document.getElementById(barId);
+  const box=document.getElementById(boxId);
+  if(!bar||!box) return;
+  const saved=parseInt(localStorage.getItem(storageKey)||'',10);
   if(saved>=180){
     box.style.flexBasis=saved+'px';
     box.style.width=saved+'px';
@@ -2741,13 +3075,29 @@ function initSplit(){
       bar.classList.remove('drag');
       document.removeEventListener('mousemove', move);
       document.removeEventListener('mouseup', up);
-      localStorage.setItem('analyzeSplit', String(parseInt(box.style.flexBasis,10)||startW));
+      localStorage.setItem(storageKey, String(parseInt(box.style.flexBasis,10)||startW));
     }
     document.addEventListener('mousemove', move);
     document.addEventListener('mouseup', up);
     e.preventDefault();
   });
 }
+function initSplit(){
+  bindSplit('splitbar','tlistbox','analyzeSplit');
+  bindSplit('vasplitbar','valistbox','vaSplit');
+}
+document.getElementById('varows').addEventListener('click', function(ev){
+  const btn=ev.target.closest('button.rowl');
+  if(!btn) return;
+  openVa(btn.getAttribute('data-kind'), btn.getAttribute('data-id'));
+});
+document.getElementById('vabody').addEventListener('click', function(ev){
+  const row=ev.target.closest('.tx');
+  if(!row) return;
+  const t=row.getAttribute('data-t');
+  if(t==null||t==='') return;
+  seekVa(t);
+});
 initSplit();
 renderAkteHint();
 </script>
@@ -2992,6 +3342,61 @@ def api_analyze_compare_export(body: Dict[str, Any]):
         content=payload,
         media_type=media,
         headers={"Content-Disposition": 'attachment; filename="%s"' % filename},
+    )
+
+
+@app.post("/api/va/curl")
+def api_va_curl(body: Dict[str, Any]):
+    return _run(lambda: STATE.set_va_curl(body.get("curl") or ""))
+
+
+@app.post("/api/va/download")
+def api_va_download(body: Dict[str, Any]):
+    return _run(
+        lambda: STATE.start_va_download(body.get("kinds") or [], body.get("curl") or "")
+    )
+
+
+@app.post("/api/va/stop")
+def api_va_stop():
+    return _run(STATE.stop_va)
+
+
+@app.get("/api/va/local")
+def api_va_local():
+    return va.list_local()
+
+
+@app.get("/api/va/item")
+def api_va_item(kind: str, item_id: str = Query(..., alias="id")):
+    if kind not in va.KINDS:
+        raise HTTPException(status_code=400, detail="Unbekannte Quelle.")
+    try:
+        return va.item_for_ui(kind, item_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+
+@app.get("/api/va/audio/{kind}/{item_id}")
+def api_va_audio(kind: str, item_id: str):
+    if kind not in va.KINDS:
+        raise HTTPException(status_code=400, detail="Unbekannte Quelle.")
+    try:
+        safe = va.sanitize_id(item_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Ungültige ID.")
+    path = va.find_audio(kind, safe)
+    if not path:
+        raise HTTPException(status_code=404, detail="Keine Audiodatei.")
+    ext = os.path.splitext(path)[1].lower()
+    media = VA_AUDIO_TYPES.get(ext, "application/octet-stream")
+    return FileResponse(
+        path,
+        media_type=media,
+        filename=os.path.basename(path),
+        content_disposition_type="inline",
     )
 
 

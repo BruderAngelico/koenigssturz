@@ -1,8 +1,8 @@
 # Königssturz
 
-Lokale Beweissicherung für eine Supabase-Datenbank und ein IONOS-Postfach, plus Auswertung der gesicherten Dateien im Browser. Es läuft nur auf deinem Rechner (`127.0.0.1`). Nichts wird in die Cloud geschickt, außer du pushst selbst nach GitHub.
+Lokale Beweissicherung für eine Supabase-Datenbank und ein IONOS-Postfach, plus Auswertung der gesicherten Dateien im Browser. Zusätzlich lädt der Karteireiter **Vereinsarchiv** Stammtische (öffentlich und intern) samt Audio lokal herunter. Es läuft nur auf deinem Rechner (`127.0.0.1`). Nichts wird in die Cloud geschickt, außer du pushst selbst nach GitHub.
 
-Die Sicherungen liegen als Ordner neben dem Programm, Namen wie `beweissicherung_2026-…`. Git ignoriert diese Ordner absichtlich: darin stehen Personen-, Rechnungs- und Maildaten.
+Die Sicherungen liegen als Ordner neben dem Programm, Namen wie `beweissicherung_2026-…`. Git ignoriert diese Ordner absichtlich: darin stehen Personen-, Rechnungs- und Maildaten. Dasselbe gilt für `vereinsarchiv/`.
 
 ## Start
 
@@ -22,7 +22,7 @@ python kingfall_web.py
 
 Der Browser öffnet sich von selbst, typischerweise [http://127.0.0.1:18765/](http://127.0.0.1:18765/). Das Terminalfenster offen lassen. Port festlegen: `python kingfall_web.py --port 18765`.
 
-Drei Karteireiter: **Supabase**, **E-Mail (IONOS)**, **Auswertung**.
+Vier Karteireiter: **Supabase**, **E-Mail (IONOS)**, **Vereinsarchiv**, **Auswertung**.
 
 ## Supabase sichern
 
@@ -44,6 +44,18 @@ Pro Tabelle entstehen typischerweise:
 ## E-Mail (IONOS) sichern
 
 IMAP, Standard `imap.ionos.de` Port 993. Große Postfächer werden in 25er-Paketen geholt. Nach einem Timeout: Ordnerliste neu holen, fertige Ordner abwählen, nur den Rest sichern. Auch hier schreibt jeder Lauf in einen neuen Ordner. Die Mail-Übersicht unten ist nur eine Liste, keine Leseansicht.
+
+## Vereinsarchiv
+
+Stammtische vom Vorstandsbereich (`vereinsarchiv-vorstand.pages.dev`). Login dort geht nur per Magic-Link, deshalb keinen Benutzer/Passwort-Login in Königssturz, sondern einen cURL aus den DevTools:
+
+1. Im Browser am Vereinsarchiv anmelden, DevTools → Network, einen API-Request als cURL kopieren.
+2. Im Karteireiter **Vereinsarchiv** einfügen, **Token übernehmen**.
+3. Öffentlich und/oder intern ankreuzen, **Download**.
+
+Schon vollständige Stammtische (JSON plus Audio, falls `audio_pfad` gesetzt ist) werden übersprungen. Es gibt keinen Zeitstempel-Ordner: alles landet in `vereinsarchiv/stammtische/` und `vereinsarchiv/stammtische_intern/`. Ein zweiter Lauf holt nur fehlende oder unvollständige Einträge.
+
+Unten die lokale Liste: Titel, Kurzfassung, Fragen, Aufgaben, Sachstand, Transkript. Audio spielt aus der lokalen Datei. Klick auf eine Transkriptzeile springt in der Aufnahme an diese Stelle.
 
 ## Auswertung
 
@@ -96,9 +108,9 @@ PNG und Befund nutzen die **sichtbaren** Spalten.
 
 ## Dateien und Git
 
-Code: `kingfall.py` (Sicherung), `kingfall_web.py` (Browser-UI), `kingfall_analyze.py` (DuckDB-Auswertung), `requirements.txt`.
+Code: `kingfall.py` (Sicherung), `kingfall_web.py` (Browser-UI), `kingfall_analyze.py` (DuckDB-Auswertung), `kingfall_vereinsarchiv.py` (Stammtische + Audio), `requirements.txt`.
 
-Repo: [github.com/bonzei123/koenigssturz](https://github.com/bonzei123/koenigssturz). Die `.gitignore` hält `.venv`, IDE-Kram und alle `beweissicherung_*`-Ordner raus. Nach Code-Änderungen:
+Repo: [github.com/bonzei123/koenigssturz](https://github.com/bonzei123/koenigssturz). Die `.gitignore` hält `.venv`, IDE-Kram, alle `beweissicherung_*`-Ordner und `vereinsarchiv/` raus. Nach Code-Änderungen:
 
 ```text
 git add -A

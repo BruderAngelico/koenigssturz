@@ -38,6 +38,8 @@ KINDS = {
         "list_select": LIST_SELECT,
         "full_select": PUBLIC_FULL_SELECT,
         "page": 200,
+        "audio_bucket": "audio",
+        "folien_bucket": "folien",
     },
     "intern": {
         "table": "stammtische_intern",
@@ -46,15 +48,21 @@ KINDS = {
         "list_select": LIST_SELECT,
         "full_select": "*",
         "page": 80,
+        "audio_bucket": "audio-intern",
+        "folien_bucket": "folien-intern",
     },
 }
 
 CANDIDATE_BUCKETS = (
+    "audio",
+    "audio-intern",
+    "audio-mitglieder",
+    "folien",
+    "folien-intern",
     "stammtische",
     "stammtische-intern",
     "stammtische_intern",
     "stammtisch-audio",
-    "audio",
     "recordings",
     "archiv",
     "vereinsarchiv",
@@ -413,7 +421,18 @@ def _try_signed(base: str, headers: dict, bucket: str, obj_path: str, dest: str)
     return 0
 
 
-def download_object(base: str, headers: dict, bucket: str, obj_path: str, dest: str) -> int:
+def download_object(
+    base: str,
+    headers: dict,
+    bucket: str,
+    obj_path: str,
+    dest: str,
+    prefer_signed: bool = False,
+) -> int:
+    if prefer_signed:
+        size = _try_signed(base, headers, bucket, obj_path, dest)
+        if size > 0:
+            return size
     req = storage_headers(headers)
     for url in _object_urls(base, bucket, obj_path):
         response = requests.get(url, headers=req, timeout=180, stream=True)
@@ -422,6 +441,8 @@ def download_object(base: str, headers: dict, bucket: str, obj_path: str, dest: 
                 return _write_stream(response, dest)
         finally:
             response.close()
+    if prefer_signed:
+        return 0
     return _try_signed(base, headers, bucket, obj_path, dest)
 
 
@@ -432,6 +453,20 @@ def _audio_dest(kind: str, item_id: str, audio_pfad: str, root: str) -> str:
     return os.path.join(item_folder(kind, item_id, root), name)
 
 
+def _bucket_order(kind: str, cache: dict, role: str, listed: Optional[list] = None) -> list:
+    buckets = []
+    preferred = KINDS.get(kind, {}).get("%s_bucket" % role)
+    if preferred:
+        buckets.append(preferred)
+    cached = cache.get("%s_%s" % (kind, role)) or (cache.get(kind) if role == "audio" else None)
+    if cached and cached not in buckets:
+        buckets.append(cached)
+    for name in list(listed or []) + list(CANDIDATE_BUCKETS):
+        if name and name not in buckets:
+            buckets.append(name)
+    return buckets
+
+
 def download_audio(
     base: str,
     headers: dict,
@@ -440,21 +475,26 @@ def download_audio(
     audio_pfad: str,
     root: str,
     cache: dict,
+    listed_buckets: Optional[list] = None,
 ) -> int:
     dest = _audio_dest(kind, item_id, audio_pfad, root)
-    buckets = []
-    cached = cache.get(kind)
-    if cached:
-        buckets.append(cached)
-    for name in list_storage_buckets(base, headers) + list(CANDIDATE_BUCKETS):
-        if name not in buckets:
-            buckets.append(name)
+    listed = listed_buckets
+    if listed is None:
+        listed = list_storage_buckets(base, headers)
     last_error = None
-    for bucket in buckets:
+    for bucket in _bucket_order(kind, cache, "audio", listed):
         try:
-            size = download_object(base, headers, bucket, audio_pfad, dest)
+            size = download_object(
+                base,
+                headers,
+                bucket,
+                audio_pfad,
+                dest,
+                prefer_signed=(kind != "public"),
+            )
             if size > 0:
                 cache[kind] = bucket
+                cache["%s_audio" % kind] = bucket
                 save_bucket_cache(root, cache)
                 return size
         except Exception as exc:
@@ -495,21 +535,32 @@ def download_folien(
     folien: Any,
     root: str,
     cache: dict,
+    listed_buckets: Optional[list] = None,
 ) -> None:
-    bucket = cache.get(kind)
-    if not bucket:
-        return
     folder = os.path.join(item_folder(kind, item_id, root), "folien")
+    buckets = _bucket_order(kind, cache, "folien", listed_buckets)
     for path in _folien_paths(folien):
         if path.startswith("http"):
             continue
         dest = os.path.join(folder, os.path.basename(path.replace("\\", "/")) or "folie")
         if _file_ok(dest):
             continue
-        try:
-            download_object(base, headers, bucket, path, dest)
-        except Exception:
-            continue
+        for bucket in buckets:
+            try:
+                size = download_object(
+                    base,
+                    headers,
+                    bucket,
+                    path,
+                    dest,
+                    prefer_signed=(kind != "public"),
+                )
+                if size > 0:
+                    cache["%s_folien" % kind] = bucket
+                    save_bucket_cache(root, cache)
+                    break
+            except Exception:
+                continue
 
 
 def save_row(kind: str, row: dict, root: str, has_audio: bool) -> None:
@@ -602,6 +653,7 @@ def download_kinds(
     root = va_root(cwd)
     os.makedirs(root, exist_ok=True)
     cache = load_bucket_cache(root)
+    listed_buckets = list_storage_buckets(base, headers)
     stats = {"total": 0, "done": 0, "skipped": 0, "failed": 0, "audio_bytes": 0, "errors": []}
     selected = [k for k in kinds if k in KINDS]
     lists = {}
@@ -646,15 +698,32 @@ def download_kinds(
                     full = fetch_full_row(base, headers, kind, item_id)
                 audio_pfad = full.get("audio_pfad") or audio_pfad
                 has_audio = find_audio(kind, item_id, root) is not None
+                save_row(kind, full, root, has_audio)
                 if audio_pfad and not has_audio:
                     size = download_audio(
-                        base, headers, kind, item_id, str(audio_pfad), root, cache
+                        base,
+                        headers,
+                        kind,
+                        item_id,
+                        str(audio_pfad),
+                        root,
+                        cache,
+                        listed_buckets,
                     )
                     stats["audio_bytes"] += size
                     has_audio = True
-                save_row(kind, full, root, has_audio)
+                    save_row(kind, full, root, True)
                 if full.get("folien"):
-                    download_folien(base, headers, kind, item_id, full.get("folien"), root, cache)
+                    download_folien(
+                        base,
+                        headers,
+                        kind,
+                        item_id,
+                        full.get("folien"),
+                        root,
+                        cache,
+                        listed_buckets,
+                    )
                 stats["done"] += 1
                 if progress_cb:
                     progress_cb(_progress_payload(stats, kind, "download", item_id, saved=True))

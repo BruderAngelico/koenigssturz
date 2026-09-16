@@ -50,7 +50,7 @@ IMAP, Standard `imap.ionos.de` Port 993. Große Postfächer werden in 25er-Paket
 Stammtische vom Vorstandsbereich (`vereinsarchiv-vorstand.pages.dev`). Login dort geht nur per Magic-Link, deshalb keinen Benutzer/Passwort-Login in Königssturz, sondern einen cURL aus den DevTools:
 
 1. Im Browser am Vereinsarchiv anmelden, DevTools → Network, einen API-Request als cURL kopieren.
-2. Im Karteireiter **Vereinsarchiv** einfügen, **Token übernehmen**.
+2. Im Karteireiter **Vereinsarchiv** einfügen, **Token übernehmen**. Am besten einen Request nach `rest/v1` oder `storage` nehmen (Host `*.supabase.co`), nicht nur einen Aufruf der pages.dev-Seite.
 3. Öffentlich und/oder intern ankreuzen, **Download**.
 
 Schon vollständige Stammtische (JSON plus Audio, falls `audio_pfad` gesetzt ist) werden übersprungen. Es gibt keinen Zeitstempel-Ordner: alles landet in `vereinsarchiv/stammtische/` und `vereinsarchiv/stammtische_intern/`. Ein zweiter Lauf holt nur fehlende oder unvollständige Einträge.

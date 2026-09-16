@@ -286,11 +286,12 @@ class WebState:
                 "Der Token ist abgelaufen. Bitte in den DevTools einen frischen Request kopieren."
             )
         auth.apply_to_headers(headers)
+        headers = va.ensure_apikey(headers, auth.access_token)
         if not kf.header_value(headers, "origin"):
             headers["Origin"] = va.VA_ORIGIN
         self.va_auth = auth
         self.va_headers = headers
-        self.va_base = va.base_from_url(url)
+        self.va_base = va.resolve_base(url, headers)
         self.va_error = ""
         self.va_status = "Token übernommen · noch ca. %s min gültig" % max(1, int(left) // 60)
 
@@ -1659,7 +1660,7 @@ function renderVaDetail(item){
   if(z.offene_fragen&&z.offene_fragen.length){
     html+=vaBlock('Offene Fragen','<ul>'+z.offene_fragen.map(function(s){return '<li>'+esc(s)+'</li>';}).join('')+'</ul>');
   }
-  if(item.transkript&&item.transkript.length){
+  if(item.transkript&&item.transkript.length&&item.transkript.map){
     html+=vaBlock('Transkript','<div id="vatx">'+item.transkript.map(function(t){
       const name=sprecher[t.sp]!=null?sprecher[t.sp]:('Sprecher '+(t.sp==null?'?':t.sp));
       return '<div class="tx" data-t="'+(t.t||0)+'"><span>'+vaDur(t.t)+'</span><span>'+esc(name)+'</span><span>'+esc(t.text||'')+'</span></div>';

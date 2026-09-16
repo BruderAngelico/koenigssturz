@@ -23,30 +23,37 @@ LIST_SELECT = (
     "id,datum,titel,ort,dauer_sek,sprecher,themen,status,"
     "audio_pfad,freigabe_status,folien"
 )
-PUBLIC_FULL_SELECT = (
+# wellenform/embedding nicht ziehen – das sprengt intern oft den Request.
+DETAIL_SELECT = (
     "id,datum,titel,ort,dauer_sek,sprecher,themen,status,zusammenfassung,"
     "transkript,folien,audio_pfad,erstellt_am,kapitel,verarbeitung,folientext,"
-    "nachverfolgung,wellenform,freigabe_status,freigegeben_von,freigegeben_am,"
+    "nachverfolgung,freigabe_status,freigegeben_von,freigegeben_am,"
     "aufbewahrung_markiert,markiert_am,markiert_grund"
+)
+SLIM_DETAIL_SELECT = (
+    "id,datum,titel,ort,dauer_sek,sprecher,themen,zusammenfassung,"
+    "transkript,audio_pfad,folien,nachverfolgung"
 )
 
 KINDS = {
     "public": {
         "table": "stammtische",
+        "tables": ("stammtische",),
         "folder": "stammtische",
         "label": "Öffentlich",
         "list_select": LIST_SELECT,
-        "full_select": PUBLIC_FULL_SELECT,
+        "full_select": DETAIL_SELECT,
         "page": 200,
         "audio_bucket": "audio",
         "folien_bucket": "folien",
     },
     "intern": {
         "table": "stammtische_intern",
+        "tables": ("stammtische_intern", "stammtisch_intern"),
         "folder": "stammtische_intern",
         "label": "Intern",
         "list_select": LIST_SELECT,
-        "full_select": "*",
+        "full_select": DETAIL_SELECT,
         "page": 80,
         "audio_bucket": "audio-intern",
         "folien_bucket": "folien-intern",
@@ -110,6 +117,62 @@ def base_from_url(url: str) -> str:
     return "%s://%s" % (parsed.scheme, parsed.netloc)
 
 
+def _is_supabase_host(host: str) -> bool:
+    h = (host or "").lower()
+    return "supabase.co" in h or "supabase.in" in h or h.endswith(".supabase.com")
+
+
+def resolve_base(url: str, headers: Optional[dict] = None) -> str:
+    """API-Host: Supabase aus der Request-URL oder, bei pages.dev-cURL, aus dem JWT."""
+    parsed = urlparse(url or "")
+    if parsed.scheme and parsed.netloc and _is_supabase_host(parsed.netloc):
+        return "%s://%s" % (parsed.scheme, parsed.netloc)
+    auth = ""
+    if headers:
+        auth = kf.header_value(headers, "Authorization") or ""
+    payload = {}
+    if auth:
+        try:
+            payload = kf.decode_jwt_payload(auth)
+        except Exception:
+            payload = {}
+    iss = payload.get("iss") if isinstance(payload, dict) else None
+    if isinstance(iss, str) and iss.startswith("http"):
+        iss_parsed = urlparse(iss)
+        if iss_parsed.scheme and iss_parsed.netloc:
+            return "%s://%s" % (iss_parsed.scheme, iss_parsed.netloc)
+    ref = payload.get("ref") if isinstance(payload, dict) else None
+    if isinstance(ref, str) and re.match(r"^[a-z0-9]+$", ref, re.I):
+        return "https://%s.supabase.co" % ref
+    if parsed.scheme and parsed.netloc and _is_supabase_host(parsed.netloc):
+        return "%s://%s" % (parsed.scheme, parsed.netloc)
+    raise ValueError(
+        "Im cURL steckt keine Supabase-API. Einen Network-Request zu rest/v1 oder storage kopieren "
+        "(nicht nur zur Seite vereinsarchiv-vorstand.pages.dev)."
+    )
+
+
+def ensure_apikey(headers: dict, access_token: Optional[str] = None) -> dict:
+    out = dict(headers)
+    if not kf.header_value(out, "apikey") and access_token:
+        out["apikey"] = access_token
+    return out
+
+
+def absolute_signed_url(base: str, signed: str) -> str:
+    signed = (signed or "").strip()
+    if not signed:
+        return ""
+    if signed.startswith("http://") or signed.startswith("https://"):
+        return signed
+    if not signed.startswith("/"):
+        signed = "/" + signed
+    origin = base.rstrip("/")
+    if signed.startswith("/storage/v1"):
+        return origin + signed
+    return origin + "/storage/v1" + signed
+
+
 def rest_headers(headers: dict) -> dict:
     out = {}
     for key, value in headers.items():
@@ -134,7 +197,7 @@ def strip_huge(row: dict, for_ui: bool = False) -> dict:
     return {k: v for k, v in row.items() if k not in drop}
 
 
-def meta_from_row(kind: str, row: dict, has_audio: bool) -> dict:
+def meta_from_row(kind: str, row: dict, has_audio: bool, detail: bool = False) -> dict:
     return {
         "id": row.get("id"),
         "kind": kind,
@@ -148,6 +211,7 @@ def meta_from_row(kind: str, row: dict, has_audio: bool) -> dict:
         "audio_pfad": row.get("audio_pfad"),
         "freigabe_status": row.get("freigabe_status"),
         "has_audio": bool(has_audio),
+        "detail": bool(detail or row.get("transkript") or row.get("zusammenfassung")),
     }
 
 
@@ -272,23 +336,35 @@ def fetch_rows(
     return rows
 
 
+def _kind_tables(kind: str) -> list:
+    spec = KINDS[kind]
+    names = []
+    for name in list(spec.get("tables") or []) + [spec.get("table")]:
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
 def fetch_list(base: str, headers: dict, kind: str, should_stop: StopFn = None) -> list:
     spec = KINDS[kind]
     selects = [spec["list_select"], "id,datum,titel,audio_pfad", "id,audio_pfad"]
     last_error = None
-    for select in selects:
-        try:
-            return fetch_rows(
-                base,
-                headers,
-                spec["table"],
-                select,
-                "datum.desc",
-                spec["page"],
-                should_stop,
-            )
-        except RuntimeError as exc:
-            last_error = exc
+    for table in _kind_tables(kind):
+        for select in selects:
+            try:
+                rows = fetch_rows(
+                    base,
+                    headers,
+                    table,
+                    select,
+                    "datum.desc",
+                    spec["page"],
+                    should_stop,
+                )
+                spec["table"] = table
+                return rows
+            except RuntimeError as exc:
+                last_error = exc
     if last_error:
         raise last_error
     return []
@@ -297,34 +373,41 @@ def fetch_list(base: str, headers: dict, kind: str, should_stop: StopFn = None) 
 def fetch_full_row(base: str, headers: dict, kind: str, item_id: str) -> dict:
     spec = KINDS[kind]
     timeout = 300 if kind == "intern" else 120
-    selects = [spec["full_select"]]
+    selects = [spec["full_select"], SLIM_DETAIL_SELECT]
     if spec["full_select"] != "*":
         selects.append("*")
     last_error = None
-    for select in selects:
-        req = rest_headers(headers)
-        url = "%s/rest/v1/%s?id=eq.%s&select=%s" % (
-            base.rstrip("/"),
-            quote(spec["table"], safe=""),
-            quote(item_id, safe=""),
-            quote(select, safe=",.*()"),
-        )
-        response = requests.get(url, headers=req, timeout=timeout)
-        if response.status_code >= 400:
-            last_error = RuntimeError(
-                "Detail %s: HTTP %s – %s"
-                % (item_id, response.status_code, (response.text or "")[:400])
+    for table in _kind_tables(kind):
+        for select in selects:
+            req = rest_headers(headers)
+            url = "%s/rest/v1/%s?id=eq.%s&select=%s" % (
+                base.rstrip("/"),
+                quote(table, safe=""),
+                quote(item_id, safe=""),
+                quote(select, safe=",.*()"),
             )
-            continue
-        rows = response.json()
-        if not isinstance(rows, list) or not rows:
-            last_error = RuntimeError("Kein Datensatz für %s." % item_id)
-            continue
-        row = rows[0]
-        if not isinstance(row, dict):
-            last_error = RuntimeError("Ungültiger Datensatz für %s." % item_id)
-            continue
-        return row
+            response = requests.get(url, headers=req, timeout=timeout)
+            if response.status_code >= 400:
+                last_error = RuntimeError(
+                    "Detail %s: HTTP %s – %s"
+                    % (item_id, response.status_code, (response.text or "")[:400])
+                )
+                continue
+            try:
+                rows = response.json()
+            except ValueError:
+                last_error = RuntimeError("Ungültige JSON-Antwort für %s." % item_id)
+                continue
+            row_list = rows if isinstance(rows, list) else None
+            if not row_list:
+                last_error = RuntimeError("Kein Datensatz für %s." % item_id)
+                continue
+            row = row_list[0]
+            if not isinstance(row, dict):
+                last_error = RuntimeError("Ungültiger Datensatz für %s." % item_id)
+                continue
+            spec["table"] = table
+            return row
     if last_error:
         raise last_error
     raise RuntimeError("Kein Datensatz für %s." % item_id)
@@ -408,11 +491,10 @@ def _try_signed(base: str, headers: dict, bucket: str, obj_path: str, dest: str)
     signed = data.get("signedURL") or data.get("signedUrl") or ""
     if not signed:
         return 0
-    if signed.startswith("http"):
-        full = signed
-    else:
-        full = base.rstrip("/") + "/storage/v1" + (signed if signed.startswith("/") else "/" + signed)
-    got = requests.get(full, timeout=180, stream=True)
+    full = absolute_signed_url(base, signed)
+    if not full:
+        return 0
+    got = requests.get(full, headers=storage_headers(headers), timeout=180, stream=True)
     try:
         if got.status_code in (200, 206):
             return _write_stream(got, dest)
@@ -447,10 +529,59 @@ def download_object(
 
 
 def _audio_dest(kind: str, item_id: str, audio_pfad: str, root: str) -> str:
-    name = os.path.basename(audio_pfad.replace("\\", "/")) or "audio.aac"
+    name = os.path.basename((audio_pfad or "").replace("\\", "/").split("?")[0]) or "audio.aac"
     if "." not in name:
         name = "audio.aac"
     return os.path.join(item_folder(kind, item_id, root), name)
+
+
+def _audio_path_text(audio_pfad: Any) -> str:
+    if isinstance(audio_pfad, str):
+        return audio_pfad.strip()
+    if isinstance(audio_pfad, dict):
+        for key in ("pfad", "path", "url", "audio_pfad"):
+            value = audio_pfad.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return ""
+
+
+def split_storage_path(path: str, known_buckets: Optional[list] = None) -> list:
+    """(bucket_or_None, object_path) – inkl. Variante mit abgetrenntem Bucket-Präfix."""
+    raw = (path or "").strip().lstrip("/")
+    if not raw:
+        return []
+    raw = raw.split("?")[0]
+    for prefix in (
+        "storage/v1/object/authenticated/",
+        "storage/v1/object/public/",
+        "storage/v1/object/sign/",
+        "storage/v1/object/",
+        "object/authenticated/",
+        "object/public/",
+        "object/sign/",
+    ):
+        if raw.startswith(prefix):
+            raw = raw[len(prefix) :]
+            break
+    known = [b for b in (known_buckets or []) if b]
+    out = []
+    first, sep, rest = raw.partition("/")
+    if sep and first in known:
+        out.append((first, rest))
+    out.append((None, raw))
+    return out
+
+
+def _download_http(url: str, headers: dict, dest: str) -> int:
+    req = storage_headers(headers)
+    response = requests.get(url, headers=req, timeout=180, stream=True)
+    try:
+        if response.status_code in (200, 206):
+            return _write_stream(response, dest)
+    finally:
+        response.close()
+    return 0
 
 
 def _bucket_order(kind: str, cache: dict, role: str, listed: Optional[list] = None) -> list:
@@ -477,31 +608,58 @@ def download_audio(
     cache: dict,
     listed_buckets: Optional[list] = None,
 ) -> int:
-    dest = _audio_dest(kind, item_id, audio_pfad, root)
+    path_text = _audio_path_text(audio_pfad)
+    if not path_text:
+        raise RuntimeError("Kein audio_pfad für %s." % item_id)
+    dest = _audio_dest(kind, item_id, path_text, root)
     listed = listed_buckets
     if listed is None:
         listed = list_storage_buckets(base, headers)
+    if path_text.startswith("http://") or path_text.startswith("https://"):
+        size = _download_http(path_text, headers, dest)
+        if size > 0:
+            return size
+        parsed = urlparse(path_text)
+        for prefix in ("/storage/v1/object/public/", "/storage/v1/object/authenticated/", "/storage/v1/object/sign/", "/storage/v1/object/"):
+            if parsed.path.startswith(prefix):
+                path_text = parsed.path[len(prefix) :]
+                break
+        else:
+            raise RuntimeError("Audio-URL nicht ladbar: %s" % item_id)
+    buckets = _bucket_order(kind, cache, "audio", listed)
     last_error = None
-    for bucket in _bucket_order(kind, cache, "audio", listed):
-        try:
-            size = download_object(
-                base,
-                headers,
-                bucket,
-                audio_pfad,
-                dest,
-                prefer_signed=(kind != "public"),
-            )
-            if size > 0:
-                cache[kind] = bucket
-                cache["%s_audio" % kind] = bucket
-                save_bucket_cache(root, cache)
-                return size
-        except Exception as exc:
-            last_error = exc
+    tried = set()
+    for hinted_bucket, obj_path in split_storage_path(path_text, buckets):
+        order = []
+        if hinted_bucket:
+            order.append(hinted_bucket)
+        for bucket in buckets:
+            if bucket not in order:
+                order.append(bucket)
+        for bucket in order:
+            key = (bucket, obj_path)
+            if key in tried:
+                continue
+            tried.add(key)
+            try:
+                size = download_object(
+                    base,
+                    headers,
+                    bucket,
+                    obj_path,
+                    dest,
+                    prefer_signed=(kind != "public"),
+                )
+                if size > 0:
+                    cache[kind] = bucket
+                    cache["%s_audio" % kind] = bucket
+                    save_bucket_cache(root, cache)
+                    return size
+            except Exception as exc:
+                last_error = exc
     if last_error:
         raise RuntimeError("Audio %s: %s" % (item_id, last_error))
-    raise RuntimeError("Audio nicht gefunden: %s (%s)" % (audio_pfad, item_id))
+    raise RuntimeError("Audio nicht gefunden: %s (%s)" % (path_text, item_id))
 
 
 def _folien_paths(folien: Any) -> list:
@@ -567,7 +725,11 @@ def save_row(kind: str, row: dict, root: str, has_audio: bool) -> None:
     item_id = sanitize_id(str(row.get("id") or ""))
     slim = strip_huge(row)
     _atomic_json(item_json_path(kind, item_id, root), slim)
-    _atomic_json(item_meta_path(kind, item_id, root), meta_from_row(kind, slim, has_audio), indent=2)
+    _atomic_json(
+        item_meta_path(kind, item_id, root),
+        meta_from_row(kind, slim, has_audio, detail=True),
+        indent=2,
+    )
 
 
 def load_local_json(kind: str, item_id: str, root: Optional[str] = None) -> Optional[dict]:
@@ -616,11 +778,149 @@ def list_local(root: Optional[str] = None) -> list:
     return items
 
 
+def _as_float(value: Any) -> Optional[float]:
+    if value is None or value is False:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        if ":" in text:
+            parts = text.split(":")
+            try:
+                nums = [float(p) for p in parts]
+            except ValueError:
+                return None
+            if len(nums) == 3:
+                return nums[0] * 3600 + nums[1] * 60 + nums[2]
+            if len(nums) == 2:
+                return nums[0] * 60 + nums[1]
+        try:
+            return float(text.replace(",", "."))
+        except ValueError:
+            return None
+    return None
+
+
+def _norm_transcript_item(item: Any, sprecher: list) -> Optional[dict]:
+    if isinstance(item, str):
+        text = item.strip()
+        return {"t": 0, "sp": None, "text": text} if text else None
+    if not isinstance(item, dict):
+        return None
+    text = item.get("text") or item.get("utterance") or item.get("inhalt") or item.get("zeile") or ""
+    if not isinstance(text, str):
+        text = str(text) if text is not None else ""
+    t = None
+    for key in ("t", "start", "start_sek", "zeit", "from"):
+        if item.get(key) is not None:
+            t = _as_float(item.get(key))
+            if t is not None:
+                break
+    if t is None:
+        t = 0.0
+    if t > 100000:
+        t = t / 1000.0
+    sp = item.get("sp")
+    if sp is None:
+        sp = item.get("speaker")
+    if sp is None:
+        sp = item.get("sprecher")
+    if isinstance(sp, str):
+        name = sp.strip()
+        if name in sprecher:
+            sp = sprecher.index(name)
+        else:
+            sprecher.append(name)
+            sp = len(sprecher) - 1
+    return {"t": t, "sp": sp, "text": text}
+
+
+def _norm_zusammenfassung(raw: Any, nach: Any) -> dict:
+    data = raw
+    if not data and isinstance(nach, dict):
+        data = nach
+    if isinstance(data, str):
+        text = data.strip()
+        return {"lead": text} if text else {}
+    if not isinstance(data, dict):
+        return {}
+    out = dict(data)
+    if not out.get("lead"):
+        for key in ("kurzfassung", "summary", "text", "einleitung"):
+            if isinstance(out.get(key), str) and out.get(key).strip():
+                out["lead"] = out[key]
+                break
+    return out
+
+
+def normalize_item_for_ui(row: dict) -> dict:
+    out = dict(row)
+    sprecher = out.get("sprecher")
+    if isinstance(sprecher, str):
+        sprecher = [s.strip() for s in sprecher.replace(";", ",").split(",") if s.strip()]
+    if not isinstance(sprecher, list):
+        sprecher = []
+    names = []
+    for item in sprecher:
+        if isinstance(item, str) and item.strip():
+            names.append(item.strip())
+        elif isinstance(item, dict):
+            label = item.get("name") or item.get("sprecher") or item.get("label")
+            if isinstance(label, str) and label.strip():
+                names.append(label.strip())
+    trans = out.get("transkript")
+    lines = []
+    if isinstance(trans, str) and trans.strip():
+        lines = [{"t": 0, "sp": None, "text": trans.strip()}]
+    elif isinstance(trans, list):
+        for item in trans:
+            norm = _norm_transcript_item(item, names)
+            if norm:
+                lines.append(norm)
+    out["sprecher"] = names
+    out["transkript"] = lines
+    out["zusammenfassung"] = _norm_zusammenfassung(out.get("zusammenfassung"), out.get("nachverfolgung"))
+    themen = out.get("themen")
+    if isinstance(themen, str):
+        out["themen"] = [t.strip() for t in themen.replace(";", ",").split(",") if t.strip()]
+    elif not isinstance(themen, list):
+        out["themen"] = []
+    return out
+
+
+def load_meta(kind: str, item_id: str, root: Optional[str] = None) -> Optional[dict]:
+    path = item_meta_path(kind, item_id, root)
+    if not _file_ok(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def needs_detail_fetch(kind: str, item_id: str, root: Optional[str] = None) -> bool:
+    row = load_local_json(kind, item_id, root)
+    if not row:
+        return True
+    meta = load_meta(kind, item_id, root) or {}
+    if meta.get("detail"):
+        return False
+    if row.get("transkript") or row.get("zusammenfassung"):
+        return False
+    return True
+
+
 def item_for_ui(kind: str, item_id: str, root: Optional[str] = None) -> dict:
     row = load_local_json(kind, item_id, root)
     if not row:
         raise FileNotFoundError("Stammtisch %s ist lokal nicht vorhanden." % item_id)
     out = strip_huge(row, for_ui=True)
+    out = normalize_item_for_ui(out)
     out["kind"] = kind
     out["has_audio"] = find_audio(kind, item_id, root) is not None
     return out
@@ -681,10 +981,11 @@ def download_kinds(
                 stats["failed"] += 1
                 stats["errors"].append("Ungültige ID übersprungen")
                 continue
-            audio_pfad = row.get("audio_pfad") or None
+            audio_pfad = _audio_path_text(row.get("audio_pfad")) or None
             json_ok = _file_ok(item_json_path(kind, item_id, root))
             audio_ok = find_audio(kind, item_id, root) is not None
-            if json_ok and (not audio_pfad or audio_ok):
+            want_detail = needs_detail_fetch(kind, item_id, root)
+            if json_ok and not want_detail and (not audio_pfad or audio_ok):
                 stats["skipped"] += 1
                 stats["done"] += 1
                 if progress_cb:
@@ -693,10 +994,12 @@ def download_kinds(
             if progress_cb:
                 progress_cb(_progress_payload(stats, kind, "download", item_id))
             try:
-                full = load_local_json(kind, item_id, root) if json_ok else None
+                full = None
+                if json_ok and not want_detail:
+                    full = load_local_json(kind, item_id, root)
                 if full is None:
                     full = fetch_full_row(base, headers, kind, item_id)
-                audio_pfad = full.get("audio_pfad") or audio_pfad
+                audio_pfad = _audio_path_text(full.get("audio_pfad")) or audio_pfad
                 has_audio = find_audio(kind, item_id, root) is not None
                 save_row(kind, full, root, has_audio)
                 if audio_pfad and not has_audio:

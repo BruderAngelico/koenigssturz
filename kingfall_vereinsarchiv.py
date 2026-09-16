@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
+import subprocess
 from typing import Any, Callable, Optional
 from urllib.parse import quote, urlparse
 
@@ -16,6 +18,23 @@ VA_ORIGIN = "https://vereinsarchiv-vorstand.pages.dev"
 VA_DIRNAME = "vereinsarchiv"
 SAFE_ID = re.compile(r"^[A-Za-z0-9._-]+$")
 AUDIO_EXT = (".aac", ".m4a", ".mp3", ".ogg", ".wav", ".webm")
+# Browser <audio>: AAC spielt zuverlässig in MP4/M4A, nacktes ADTS (.aac) oft nicht.
+AUDIO_MIME = {
+    "mp4": "audio/mp4",
+    "adts": "audio/aac",
+    "mp3": "audio/mpeg",
+    "ogg": "audio/ogg",
+    "wav": "audio/wav",
+    "webm": "audio/webm",
+}
+EXT_MIME = {
+    ".aac": "audio/aac",
+    ".m4a": "audio/mp4",
+    ".mp3": "audio/mpeg",
+    ".ogg": "audio/ogg",
+    ".wav": "audio/wav",
+    ".webm": "audio/webm",
+}
 HUGE_FIELDS = ("embedding", "fts", "suche", "wellenform")
 UI_DROP = HUGE_FIELDS + ("volltext",)
 
@@ -219,26 +238,119 @@ def _file_ok(path: str) -> bool:
     return os.path.isfile(path) and os.path.getsize(path) > 2
 
 
+def sniff_audio_kind(path: str) -> Optional[str]:
+    """Container anhand Dateimagie, nicht anhand der Endung."""
+    if not os.path.isfile(path) or os.path.getsize(path) < 12:
+        return None
+    try:
+        with open(path, "rb") as handle:
+            head = handle.read(16)
+    except OSError:
+        return None
+    if not head:
+        return None
+    stripped = head.lstrip()
+    if stripped[:1] in (b"{", b"[", b"<"):
+        return None
+    if head.startswith(b"OggS"):
+        return "ogg"
+    if head.startswith(b"RIFF") and head[8:12] == b"WAVE":
+        return "wav"
+    if head.startswith(b"ID3"):
+        return "mp3"
+    if len(head) >= 2 and head[0] == 0xFF and (head[1] & 0xE0) == 0xE0:
+        if (head[1] & 0x06) == 0x02:
+            return "mp3"
+        if (head[1] & 0xF6) == 0xF0:
+            return "adts"
+    if len(head) >= 8 and head[4:8] == b"ftyp":
+        return "mp4"
+    if head.startswith(b"\x1aE\xdf\xa3"):
+        return "webm"
+    return None
+
+
+def audio_media_type(path: str) -> str:
+    kind = sniff_audio_kind(path)
+    if kind:
+        return AUDIO_MIME[kind]
+    return EXT_MIME.get(os.path.splitext(path)[1].lower(), "application/octet-stream")
+
+
+def _remux_adts_to_m4a(src: str, dest: str) -> bool:
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        return False
+    os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
+    tmp = dest + ".part"
+    try:
+        proc = subprocess.run(
+            [ffmpeg, "-y", "-loglevel", "error", "-i", src, "-c", "copy", tmp],
+            capture_output=True,
+            timeout=120,
+        )
+        if proc.returncode != 0 or not os.path.isfile(tmp) or sniff_audio_kind(tmp) != "mp4":
+            if os.path.exists(tmp):
+                os.remove(tmp)
+            return False
+        os.replace(tmp, dest)
+        return True
+    except (OSError, subprocess.TimeoutExpired):
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        return False
+
+
+def playback_audio(path: str) -> tuple[str, str]:
+    """Datei + MIME, die der Browser in <audio> abspielen kann."""
+    kind = sniff_audio_kind(path)
+    mime = audio_media_type(path)
+    if kind == "adts":
+        dest = os.path.join(os.path.dirname(path), "audio.play.m4a")
+        if sniff_audio_kind(dest) == "mp4" or _remux_adts_to_m4a(path, dest):
+            return dest, AUDIO_MIME["mp4"]
+    return path, mime
+
+
+def _keep_downloaded_audio(dest: str, size: int) -> int:
+    if size <= 0:
+        return 0
+    if sniff_audio_kind(dest):
+        return size
+    try:
+        os.remove(dest)
+    except OSError:
+        pass
+    return 0
+
+
 def find_audio(kind: str, item_id: str, root: Optional[str] = None) -> Optional[str]:
     folder = item_folder(kind, item_id, root)
     if not os.path.isdir(folder):
         return None
-    preferred = []
-    others = []
+    hits = []
     for name in os.listdir(folder):
         lower = name.lower()
-        if lower.endswith(".part"):
+        if lower.endswith(".part") or lower.endswith(".play.m4a"):
             continue
         path = os.path.join(folder, name)
         if not os.path.isfile(path) or os.path.getsize(path) <= 0:
             continue
-        if lower.startswith("audio.") or lower.endswith(AUDIO_EXT):
-            if lower.startswith("audio."):
-                preferred.append(path)
-            else:
-                others.append(path)
-    hits = preferred or others
-    return hits[0] if hits else None
+        if not (lower.startswith("audio.") or lower.endswith(AUDIO_EXT)):
+            continue
+        sniffed = sniff_audio_kind(path)
+        if not sniffed:
+            continue
+        rank = 0 if sniffed != "adts" else 1
+        prefer = 0 if lower.startswith("audio.") else 1
+        hits.append((rank, prefer, name, path))
+    if not hits:
+        return None
+    hits.sort()
+    return hits[0][3]
 
 
 def is_complete(kind: str, item_id: str, audio_pfad: Optional[str], root: Optional[str] = None) -> bool:
@@ -616,7 +728,7 @@ def download_audio(
     if listed is None:
         listed = list_storage_buckets(base, headers)
     if path_text.startswith("http://") or path_text.startswith("https://"):
-        size = _download_http(path_text, headers, dest)
+        size = _keep_downloaded_audio(dest, _download_http(path_text, headers, dest))
         if size > 0:
             return size
         parsed = urlparse(path_text)
@@ -650,6 +762,8 @@ def download_audio(
                     dest,
                     prefer_signed=(kind != "public"),
                 )
+                if size > 0:
+                    size = _keep_downloaded_audio(dest, size)
                 if size > 0:
                     cache[kind] = bucket
                     cache["%s_audio" % kind] = bucket

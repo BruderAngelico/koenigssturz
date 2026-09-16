@@ -26,14 +26,6 @@ import kingfall_vereinsarchiv as va
 
 HOST = "127.0.0.1"
 PORT_CANDIDATES = (18765, 18080, 19000, 8088, 8000, 8765)
-VA_AUDIO_TYPES = {
-    ".aac": "audio/aac",
-    ".m4a": "audio/mp4",
-    ".mp3": "audio/mpeg",
-    ".ogg": "audio/ogg",
-    ".wav": "audio/wav",
-    ".webm": "audio/webm",
-}
 
 
 def _port_from_args():
@@ -3391,12 +3383,12 @@ def api_va_audio(kind: str, item_id: str):
     path = va.find_audio(kind, safe)
     if not path:
         raise HTTPException(status_code=404, detail="Keine Audiodatei.")
-    ext = os.path.splitext(path)[1].lower()
-    media = VA_AUDIO_TYPES.get(ext, "application/octet-stream")
+    path, media = va.playback_audio(path)
+    play_name = "audio.m4a" if media == "audio/mp4" else os.path.basename(path)
     return FileResponse(
         path,
         media_type=media,
-        filename=os.path.basename(path),
+        filename=play_name,
         content_disposition_type="inline",
     )
 

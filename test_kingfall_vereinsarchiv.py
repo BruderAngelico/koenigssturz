@@ -91,5 +91,32 @@ class LocalCompleteTests(unittest.TestCase):
             self.assertFalse(va.needs_detail_fetch("intern", "abc-1", tmp))
 
 
-if __name__ == "__main__":
-    unittest.main()
+class AudioSniffTests(unittest.TestCase):
+    def _write(self, folder, name, data):
+        path = os.path.join(folder, name)
+        with open(path, "wb") as handle:
+            handle.write(data)
+        return path
+
+    def test_m4a_named_aac_is_mp4(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write(tmp, "clip.aac", b"\x00\x00\x00\x18ftypM4A " + b"\x00" * 8)
+            self.assertEqual(va.sniff_audio_kind(path), "mp4")
+            self.assertEqual(va.audio_media_type(path), "audio/mp4")
+            play, mime = va.playback_audio(path)
+            self.assertEqual(play, path)
+            self.assertEqual(mime, "audio/mp4")
+
+    def test_json_named_aac_is_not_audio(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = va.item_folder("public", "id1", tmp)
+            os.makedirs(folder)
+            self._write(folder, "talk.aac", b'{"statusCode":400,"message":"error"}\n')
+            self.assertIsNone(va.sniff_audio_kind(os.path.join(folder, "talk.aac")))
+            self.assertIsNone(va.find_audio("public", "id1", tmp))
+
+    def test_adts_header(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write(tmp, "raw.aac", bytes([0xFF, 0xF1, 0x50, 0x80, 0x01, 0x3F, 0xFC]) + b"\x00" * 16)
+            self.assertEqual(va.sniff_audio_kind(path), "adts")
+            self.assertEqual(va.audio_media_type(path), "audio/aac")

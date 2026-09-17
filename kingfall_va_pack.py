@@ -8,6 +8,7 @@ import os
 import shutil
 import sys
 import tempfile
+import threading
 import time
 import zipfile
 from datetime import datetime
@@ -117,7 +118,7 @@ def _progress(cb: ProgressCb, **info) -> None:
         cb(info)
 
 
-def _copy_item(src_root: str, dest_root: str, kind: str, src_id: str, dest_id: str) -> None:
+def _copy_item(src_root: str, dest_root: str, kind: str, src_id: str, dest_id: str, slim_audio: bool = False) -> None:
     src_id = va.sanitize_id(src_id)
     dest_id = va.sanitize_id(dest_id)
     src_json = va.item_json_path(kind, src_id, src_root)
@@ -145,10 +146,43 @@ def _copy_item(src_root: str, dest_root: str, kind: str, src_id: str, dest_id: s
     va._atomic_json(va.item_meta_path(kind, dest_id, dest_root), meta, indent=2)
     src_folder = va.item_folder(kind, src_id, src_root)
     dest_folder = va.item_folder(kind, dest_id, dest_root)
-    if os.path.isdir(src_folder):
-        if os.path.isdir(dest_folder):
-            shutil.rmtree(dest_folder)
+    if not os.path.isdir(src_folder):
+        return
+    if os.path.isdir(dest_folder):
+        shutil.rmtree(dest_folder)
+    if not slim_audio:
         shutil.copytree(src_folder, dest_folder)
+        return
+
+    os.makedirs(dest_folder, exist_ok=True)
+    audio_src = va.find_audio(kind, src_id, src_root)
+    play = None
+    if audio_src:
+        cache = va.play_cache_path(audio_src)
+        if os.path.isfile(cache) and os.path.getsize(cache) > 2:
+            play = cache
+        elif os.path.splitext(audio_src)[1].lower() in va.WEBKIT_SAFE_EXT:
+            play = audio_src
+        elif os.path.basename(audio_src).lower() == va.PLAY_CACHE_NAME:
+            play = audio_src
+    skip_audio = set()
+    if play:
+        # Nur abspielbares Audio ins Paket – keine Original-Gigabyte-Dateien.
+        dest_audio = os.path.join(dest_folder, "audio.m4a")
+        shutil.copy2(play, dest_audio)
+        for name in os.listdir(src_folder):
+            lower = name.lower()
+            if lower == va.PLAY_CACHE_NAME or lower.startswith("audio.") or lower.endswith(va.AUDIO_EXT):
+                skip_audio.add(name)
+    for name in os.listdir(src_folder):
+        if name in skip_audio:
+            continue
+        src_path = os.path.join(src_folder, name)
+        dest_path = os.path.join(dest_folder, name)
+        if os.path.isdir(src_path):
+            shutil.copytree(src_path, dest_path)
+        elif os.path.isfile(src_path):
+            shutil.copy2(src_path, dest_path)
 
 
 def _unique_copy_id(kind: str, item_id: str, root: str) -> str:
@@ -191,19 +225,66 @@ def build_zip(
         convert_total = len(convert_jobs)
         for index, item in enumerate(convert_jobs, start=1):
             _check_stop(stop)
+            title = item.get("titel") or item.get("id")
+            base_pct = int(round(18.0 * (index - 1) / max(1, convert_total)))
+            prep = va.AudioPrep()
+            with prep.lock:
+                prep.running = True
+                prep.index = index
+                prep.total = convert_total
+                prep.kind = item.get("kind") or ""
+                prep.item_id = item.get("id") or ""
+                prep.status = "Wandle für Paket %s/%s: %s" % (index, convert_total, title)
+
+            done = {"ok": False}
+
+            def _pump():
+                while not done["ok"]:
+                    with prep.lock:
+                        if stop and stop():
+                            prep.stop = True
+                        file_pct = int(prep.file_pct or 0)
+                    pct = base_pct + int(round(18.0 * (file_pct / 100.0) / max(1, convert_total)))
+                    _progress(
+                        progress,
+                        current=index,
+                        total=max(1, convert_total),
+                        pct=min(18, pct),
+                        status="Wandle für Paket %s/%s: %s (%s%%)" % (index, convert_total, title, file_pct),
+                    )
+                    time.sleep(0.4)
+
             _progress(
                 progress,
                 current=index,
                 total=max(1, convert_total),
-                pct=int(round(20.0 * (index - 1) / max(1, convert_total))),
-                status="Wandle für Paket %s/%s: %s" % (index, convert_total, item.get("titel") or item.get("id")),
+                pct=base_pct,
+                status="Wandle für Paket %s/%s: %s" % (index, convert_total, title),
             )
             dur = item.get("dauer_sek")
             try:
                 dur_f = float(dur) if dur is not None else 0.0
             except (TypeError, ValueError):
                 dur_f = 0.0
-            va.convert_if_needed(item["kind"], item["id"], src, duration_sec=dur_f)
+            pump = threading.Thread(target=_pump, daemon=True)
+            pump.start()
+            try:
+                ok = va.convert_if_needed(item["kind"], item["id"], src, duration_sec=dur_f, prep=prep)
+                if not ok:
+                    raise ValueError(
+                        "Audio konnte nicht gewandelt werden: %s" % (item.get("titel") or item.get("id"))
+                    )
+                path = va.find_audio(item["kind"], item["id"], src)
+                if path and va.needs_audio_convert(path):
+                    raise ValueError(
+                        "Audio noch nicht abspielbar: %s" % (item.get("titel") or item.get("id"))
+                    )
+            finally:
+                done["ok"] = True
+                with prep.lock:
+                    prep.running = False
+                    prep.proc = None
+                pump.join(timeout=2)
         for index, item in enumerate(items, start=1):
             _check_stop(stop)
             kind = item["kind"]
@@ -212,11 +293,11 @@ def build_zip(
                 progress,
                 current=index,
                 total=total,
-                pct=20 + int(round(75.0 * (index - 1) / total)),
+                pct=20 + int(round(55.0 * (index - 1) / max(1, len(items)))),
                 eta_sec=_eta_sec(started, index - 1, total) if index > 1 else None,
                 status="Kopiere %s/%s: %s" % (index, len(items), item.get("titel") or item_id),
             )
-            _copy_item(src, bundle_root, kind, item_id, item_id)
+            _copy_item(src, bundle_root, kind, item_id, item_id, slim_audio=True)
             packed.append(
                 {
                     "kind": kind,
@@ -230,6 +311,8 @@ def build_zip(
             "format": "koenigssturz-va-paket",
             "version": 1,
             "created": datetime.now().isoformat(timespec="seconds"),
+            "audio_format": "m4a",
+            "audio_ready": True,
             "kinds": sorted({p["kind"] for p in packed}),
             "count": len(packed),
             "items": packed,
@@ -237,23 +320,37 @@ def build_zip(
         with open(os.path.join(tmp, MANIFEST_NAME), "w", encoding="utf-8") as handle:
             json.dump(manifest, handle, ensure_ascii=False, indent=2)
         os.makedirs(os.path.dirname(dest_zip) or ".", exist_ok=True)
+        files = []
+        for dirpath, _, filenames in os.walk(tmp):
+            for name in filenames:
+                full = os.path.join(dirpath, name)
+                rel = os.path.relpath(full, tmp).replace("\\", "/")
+                files.append((full, rel))
+        file_total = max(1, len(files))
         _progress(
             progress,
-            current=total,
-            total=total,
-            pct=95,
-            eta_sec=_eta_sec(started, len(items), total),
-            status="Schreibe Zip …",
+            current=0,
+            total=file_total,
+            pct=78,
+            status="Schreibe Zip (0/%s) …" % file_total,
         )
-        _check_stop(stop)
-        with zipfile.ZipFile(dest_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-            for dirpath, _, filenames in os.walk(tmp):
-                for name in filenames:
-                    _check_stop(stop)
-                    full = os.path.join(dirpath, name)
-                    rel = os.path.relpath(full, tmp)
-                    zf.write(full, rel.replace("\\", "/"))
-        _progress(progress, current=total, total=total, pct=100, eta_sec=0, status="Fertig")
+        store_ext = {".m4a", ".mp3", ".aac", ".ogg", ".opus", ".zip", ".pdf"}
+        with zipfile.ZipFile(dest_zip, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=1) as zf:
+            for index, (full, rel) in enumerate(files, start=1):
+                _check_stop(stop)
+                ext = os.path.splitext(rel)[1].lower()
+                comp = zipfile.ZIP_STORED if ext in store_ext else zipfile.ZIP_DEFLATED
+                zf.write(full, rel, compress_type=comp)
+                if index == 1 or index == file_total or index % 3 == 0:
+                    _progress(
+                        progress,
+                        current=index,
+                        total=file_total,
+                        pct=78 + int(round(20.0 * index / file_total)),
+                        eta_sec=_eta_sec(started, index, file_total + max(1, len(items))),
+                        status="Schreibe Zip %s/%s …" % (index, file_total),
+                    )
+        _progress(progress, current=total, total=total, pct=100, status="Fertig")
         return {"ok": True, "count": len(packed), "path": dest_zip, "items": packed}
     except va.JobCancelled:
         try:
@@ -428,14 +525,14 @@ def apply_import(
                 status="Speichere %s/%s: %s" % (index, total, item.get("titel") or item.get("id")),
             )
             if item in preview["new"]:
-                _copy_item(src, dest, item["kind"], item["id"], item["id"])
+                _copy_item(src, dest, item["kind"], item["id"], item["id"], slim_audio=True)
                 added += 1
             elif item in preview["audio"]:
-                _copy_item(src, dest, item["kind"], item["id"], item["id"])
+                _copy_item(src, dest, item["kind"], item["id"], item["id"], slim_audio=True)
                 updated_audio += 1
             else:
                 new_id = _unique_copy_id(item["kind"], item["id"], dest)
-                _copy_item(src, dest, item["kind"], item["id"], new_id)
+                _copy_item(src, dest, item["kind"], item["id"], new_id, slim_audio=True)
                 meta_path = va.item_meta_path(item["kind"], new_id, dest)
                 meta = {}
                 if va._file_ok(meta_path):

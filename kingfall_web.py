@@ -6,6 +6,8 @@ import json
 import os
 import re
 import secrets
+import shutil
+import subprocess
 import socket
 import ssl
 import sys
@@ -140,6 +142,7 @@ class WebState:
         self.pack_progress = {}
         self.pack_error = ""
         self.pack_url = ""
+        self.pack_saved_path = ""
         threading.Thread(target=self._watchdog, daemon=True).start()
 
     def snapshot(self):
@@ -197,6 +200,7 @@ class WebState:
                 "pack_progress": dict(self.pack_progress),
                 "pack_error": self.pack_error,
                 "pack_url": self.pack_url,
+                "pack_saved_path": self.pack_saved_path,
             }
 
     def _bar(self, exported, total, status):
@@ -498,6 +502,7 @@ class WebState:
             self.pack_stop = False
             self.pack_error = ""
             self.pack_url = ""
+            self.pack_saved_path = ""
             self.pack_progress = {"status": "Starte …", "pct": 0, "eta_sec": None}
         threading.Thread(
             target=self._pack_worker,
@@ -536,16 +541,32 @@ class WebState:
             stamp = datetime.now().strftime("%Y-%m-%d")
             tags = "-".join(kinds) if kinds else "va"
             filename = "va-paket_%s_%s.zip" % (stamp, tags)
+            out_dir = os.path.join(os.path.expanduser("~"), "Documents", "Königssturz", "Pakete")
+            os.makedirs(out_dir, exist_ok=True)
+            out_path = os.path.join(out_dir, filename)
+            try:
+                if os.path.abspath(handle.name) != os.path.abspath(out_path):
+                    shutil.move(handle.name, out_path)
+                final_path = out_path
+            except OSError:
+                final_path = handle.name
+            size_mb = 0
+            try:
+                size_mb = int(round(os.path.getsize(final_path) / (1024 * 1024.0)))
+            except OSError:
+                pass
             token = secrets.token_hex(16)
             with PACK_LOCK:
-                PACK_FILES[token] = {"path": handle.name, "filename": filename}
+                PACK_FILES[token] = {"path": final_path, "filename": filename, "keep": True}
             with self.lock:
+                self.pack_saved_path = final_path if final_path == out_path else ""
                 self.pack_url = "/api/va/pack/file/%s" % token
                 self.pack_progress = {
-                    "status": "Fertig – Speichern",
+                    "status": "Fertig (%s MB) – %s" % (size_mb, out_path if final_path == out_path else filename),
                     "pct": 100,
-                    "eta_sec": 0,
                 }
+            if final_path == out_path and sys.platform == "darwin":
+                subprocess.Popen(["/usr/bin/open", "-R", out_path], close_fds=True)
         except va.JobCancelled:
             try:
                 os.remove(handle.name)
@@ -553,7 +574,7 @@ class WebState:
                 pass
             with self.lock:
                 self.pack_error = ""
-                self.pack_progress = {"status": "Abgebrochen", "pct": 0, "eta_sec": None}
+                self.pack_progress = {"status": "Abgebrochen", "pct": 0}
         except Exception as exc:
             try:
                 os.remove(handle.name)
@@ -561,7 +582,7 @@ class WebState:
                 pass
             with self.lock:
                 self.pack_error = str(exc)
-                self.pack_progress = {"status": "Fehler", "pct": 0, "eta_sec": None}
+                self.pack_progress = {"status": "Fehler", "pct": 0}
         finally:
             with self.lock:
                 self.pack_running = False
@@ -1310,7 +1331,18 @@ textarea.paused{background:#fff4cc;}
 #va fieldset.bottom{flex:1 1 0;min-height:0;overflow:hidden;display:flex;flex-direction:column;}
 #va .split{flex:1;min-height:0;overflow:hidden;}
 #va .tlist{flex:0 0 760px;width:760px;min-width:280px;max-width:75%;}
-#vapack .head,#vapack .rowl{grid-template-columns:28px 88px 1.4fr 64px 44px 44px 48px;}
+#vapack{--pack-cols:28px 88px 180px 64px 44px 44px 48px;flex:1;min-height:72px;max-height:none;overflow:auto;}
+#vapack .head,#vapack .rowl,#vapack label.rowl{grid-template-columns:var(--pack-cols)!important;gap:6px;width:max-content;min-width:100%;box-sizing:border-box;}
+#vapack .head{display:grid;position:sticky;top:0;z-index:3;}
+#vapack .head .vacol{position:relative;padding-right:8px;overflow:visible;min-width:0;display:flex;align-items:center;}
+#vapack .head .vacol .vacol-lab{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;flex:1;}
+#vapack .head .colres{position:absolute;right:-4px;top:0;bottom:0;width:9px;cursor:col-resize;z-index:5;background:transparent;}
+#vapack .head .colres::before{content:"";position:absolute;left:50%;top:3px;bottom:3px;width:1px;background:#8a847a;transform:translateX(-50%);}
+#vapack .head .colres:hover::before,#vapack .head .colres.drag::before{width:2px;background:#3d6b99;}
+#vapack .head .colres:hover,#vapack .head .colres.drag{background:rgba(61,107,153,.14);}
+#vapack .rowl > span:not(:last-child),#vapack .head .vacol:not(:last-child){box-shadow:inset -1px 0 0 #d9d3c8;}
+#vapack label.rowl{display:grid;align-items:center;padding:6px 8px;font-size:12px;border-bottom:1px solid #ddd;cursor:pointer;}
+#vapack .rowl span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;}
 #vapackbox{flex:0 0 auto;max-height:min(260px,34vh);overflow:hidden;display:flex;flex-direction:column;min-height:0;}
 .vaplayer{flex:0 0 auto;background:var(--bg);border-top:1px solid #c4bfb4;padding:2px 0 0;}
 .vaplayer audio{width:100%;height:32px;display:block;}
@@ -1550,7 +1582,7 @@ table.data td.jump{cursor:pointer;text-decoration:underline dotted;}
     </div>
     <div class="job" id="packjob"><div class="bar"><i id="packbar"></i></div><div class="meta" id="packmeta"></div></div>
     <div class="list" id="vapack">
-      <div class="head"><span></span><span>Datum</span><span>Titel</span><span>Quelle</span><span>Audio</span><span>Docs</span><span>Dauer</span></div>
+      <div class="head" id="vapackhead"></div>
       <div id="vapackrows"></div>
     </div>
     <div class="err" id="vapackerr"></div>
@@ -2162,7 +2194,12 @@ function renderVaDetail(item){
 }
 async function deleteVaSelected(){
   const picked=vaSelectedItems();
-  if(!picked.length){ alert('Keine Stammtische markiert.'); return; }
+  const hint=document.getElementById('vahint');
+  if(!picked.length){
+    if(hint) hint.textContent='Keine Stammtische markiert.';
+    alert('Keine Stammtische markiert.');
+    return;
+  }
   if(!confirm(picked.length+' Stammtisch'+(picked.length===1?'':'e')+' lokal löschen?\n\nAudio, Folien und Text werden entfernt. Beim nächsten Download können sie neu geladen werden.')) return;
   const payload={items:picked.map(function(it){return {kind:it.kind,id:it.id};})};
   const r=await fetch('/api/va/item/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
@@ -2186,10 +2223,12 @@ async function deleteVaSelected(){
   vaColsFitted=false;
   renderVaList();
   renderVaPack();
+  if(hint) hint.textContent=(d.deleted||[]).length+' gelöscht';
 }
 function fmtEta(sec){
   if(sec==null||sec==='') return '';
   sec=Math.max(0,parseInt(sec,10)||0);
+  if(sec<=0) return '';
   if(sec<60) return 'noch ca. '+sec+' s';
   return 'noch ca. '+Math.floor(sec/60)+' min '+ (sec%60)+' s';
 }
@@ -2277,6 +2316,57 @@ function vaPackKinds(){
   if(document.getElementById('vapackintern').checked) kinds.push('intern');
   return kinds;
 }
+let packColWidths=null;
+const PACK_COL_LABELS=['','Datum','Titel','Quelle','Audio','Docs','Dauer'];
+const PACK_COL_MIN=[28,72,140,58,44,44,48];
+const PACK_COL_MAX=[40,110,320,90,56,56,64];
+function packApplyCols(){
+  const list=document.getElementById('vapack');
+  if(!list) return;
+  if(!packColWidths||packColWidths.length!==PACK_COL_MIN.length) packColWidths=PACK_COL_MIN.slice();
+  const parts=packColWidths.map(function(w,i){
+    const lo=PACK_COL_MIN[i];
+    const hi=PACK_COL_MAX[i]||Math.max(lo*4, 320);
+    const n=Math.max(lo, Math.min(hi, w||lo));
+    packColWidths[i]=n;
+    return n+'px';
+  });
+  list.style.setProperty('--pack-cols', parts.join(' '));
+}
+function packRenderHead(){
+  const head=document.getElementById('vapackhead');
+  if(!head) return;
+  head.innerHTML=PACK_COL_LABELS.map(function(label,i){
+    const grip=i<PACK_COL_LABELS.length-1?'<i class="colres" data-col="'+i+'" title="Breite ziehen"></i>':'';
+    if(i===0) return '<span class="vacol vasel">'+grip+'</span>';
+    return '<span class="vacol"><span class="vacol-lab">'+esc(label)+'</span>'+grip+'</span>';
+  }).join('');
+  head.querySelectorAll('.colres').forEach(function(grip){
+    grip.onmousedown=function(e){
+      e.preventDefault();
+      e.stopPropagation();
+      const idx=parseInt(grip.getAttribute('data-col'),10);
+      if(isNaN(idx)) return;
+      if(!packColWidths||packColWidths.length!==PACK_COL_MIN.length) packApplyCols();
+      const startX=e.clientX;
+      const startW=packColWidths[idx];
+      grip.classList.add('drag');
+      function move(ev){
+        const hi=PACK_COL_MAX[idx]||Math.max(PACK_COL_MIN[idx]*4, 480);
+        packColWidths[idx]=Math.max(PACK_COL_MIN[idx], Math.min(hi, startW+(ev.clientX-startX)));
+        packApplyCols();
+      }
+      function up(){
+        grip.classList.remove('drag');
+        document.removeEventListener('mousemove', move);
+        document.removeEventListener('mouseup', up);
+      }
+      document.addEventListener('mousemove', move);
+      document.addEventListener('mouseup', up);
+    };
+  });
+  packApplyCols();
+}
 function vaPackRows(){
   const kinds=vaPackKinds();
   const from=document.getElementById('vapackfrom').value||'';
@@ -2290,14 +2380,16 @@ function vaPackRows(){
   });
 }
 function renderVaPack(){
+  if(!document.getElementById('vapackhead')||!document.getElementById('vapackhead').children.length) packRenderHead();
   const rows=vaPackRows();
   const box=document.getElementById('vapackrows');
   if(!box) return;
   document.getElementById('vapackhint').textContent=rows.length?(rows.length+' lokal passend'):'Nichts lokal für diese Auswahl';
   box.innerHTML=rows.map(function(it){
     const hint=it.hinweis?' title="'+escAttr(it.hinweis)+'"':'';
-    return '<label class="rowl"'+hint+'><span><input type="checkbox" class="vapackcb" data-kind="'+escAttr(it.kind)+'" data-id="'+escAttr(it.id)+'" checked></span><span>'+esc(it.datum||'')+'</span><span>'+esc(it.titel||it.id||'')+'</span><span>'+esc(vaKindLabel(it.kind))+'</span><span>'+vaYes(it.has_audio)+'</span><span>'+vaYes(it.has_folien)+'</span><span>'+vaDur(it.dauer_sek)+'</span></label>';
+    return '<label class="rowl"'+hint+'><span class="vasel"><input type="checkbox" class="vapackcb" data-kind="'+escAttr(it.kind)+'" data-id="'+escAttr(it.id)+'" checked></span><span class="vadatum">'+esc(it.datum||'')+'</span><span class="vatitle">'+esc(it.titel||it.id||'')+'</span><span class="vaquelle">'+esc(vaKindLabel(it.kind))+'</span><span class="vaaudio">'+vaYes(it.has_audio)+'</span><span class="vadocs">'+vaYes(it.has_folien)+'</span><span class="vadauer">'+vaDur(it.dauer_sek)+'</span></label>';
   }).join('');
+  packApplyCols();
 }
 function vaPackCheck(on){
   document.querySelectorAll('.vapackcb').forEach(function(el){ el.checked=!!on; });
@@ -2309,26 +2401,25 @@ function updatePackJob(s){
   const stop=document.getElementById('btnPackStop');
   if(btn) btn.disabled=running;
   if(stop) stop.disabled=!running;
-  const text=(p.status||'')+(p.eta_sec!=null && running?(' · '+fmtEta(p.eta_sec)):'');
-  setJob('packjob', running || (p.pct>0 && p.pct<100), p.pct||0, text);
+  const eta=(p.eta_sec!=null && running)?fmtEta(p.eta_sec):'';
+  const text=(p.status||'')+(eta?(' · '+eta):'');
+  setJob('packjob', running, running ? (p.pct || 0) : 0, running ? text : '');
   const err=document.getElementById('vapackerr');
   if(err && s.pack_error) err.textContent=s.pack_error;
-  if(s.pack_url && !running && !window._packSavedUrl){
-    window._packSavedUrl=s.pack_url;
-    const frame=document.getElementById('vapackdl')||document.createElement('iframe');
-    frame.id='vapackdl';
-    frame.style.display='none';
-    if(!frame.parentNode) document.body.appendChild(frame);
-    frame.src=s.pack_url;
-    const hint=document.getElementById('vapackhint');
-    if(hint) hint.textContent='Speichern …';
+  const hint=document.getElementById('vapackhint');
+  if(hint){
+    if(running){
+      hint.textContent=p.status||'Paket …';
+    }else if(s.pack_saved_path){
+      hint.textContent='Gespeichert: '+s.pack_saved_path;
+    }else if(p.status){
+      hint.textContent=p.status;
+    }
   }
-  if(running) window._packSavedUrl='';
 }
 async function packVa(){
   const err=document.getElementById('vapackerr');
   err.textContent='';
-  window._packSavedUrl='';
   const kinds=vaPackKinds();
   if(!kinds.length){ err.textContent='Öffentlich und/oder intern ankreuzen.'; return; }
   const ids=[];
@@ -3779,6 +3870,7 @@ document.getElementById('vabody').addEventListener('click', function(ev){
   seekVa(t);
 });
 vaRenderHead();
+packRenderHead();
 initSplit();
 renderAkteHint();
 ['vapackpublic','vapackintern','vapackfrom','vapackto'].forEach(function(id){
@@ -4238,8 +4330,11 @@ def api_va_pack_file(token: str):
         raise HTTPException(status_code=404, detail="Paket nicht mehr da. Noch einmal erzeugen.")
     path = info["path"]
     filename = info["filename"]
+    keep = bool(info.get("keep"))
 
     def _cleanup():
+        if keep:
+            return
         try:
             os.remove(path)
         except OSError:

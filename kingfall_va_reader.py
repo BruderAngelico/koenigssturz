@@ -194,11 +194,18 @@ class ReaderState:
                 except OSError:
                     pass
             if result.get("ok"):
-                va.convert_pending(root=_root(), progress_cb=self._progress, stop_fn=self._stop)
                 with self.lock:
-                    snap = va.AUDIO_PREP.snapshot()
+                    self.imp_phase = "convert"
+                    self.imp_progress = {"status": "Prüfe Audio …", "pct": 95}
+                conv = va.convert_pending(
+                    root=_root(), progress_cb=self._progress, stop_fn=self._stop
+                )
+                with self.lock:
+                    st = self.imp_progress.get("status") or conv.get("status") or "Fertig"
+                    if conv.get("total", 0) == 0:
+                        st = "Fertig – Audio aus Paket"
                     self.imp_progress = {
-                        "status": snap.get("status") or "Audio bereit",
+                        "status": st,
                         "pct": 100,
                         "eta_sec": 0,
                     }
@@ -653,7 +660,12 @@ function renderVaDetail(item){
 }
 async function deleteVaSelected(){
   const picked=vaSelectedItems();
-  if(!picked.length){ alert('Keine Stammtische markiert.'); return; }
+  const hint=document.getElementById('vahint');
+  if(!picked.length){
+    if(hint) hint.textContent='Keine Stammtische markiert.';
+    alert('Keine Stammtische markiert.');
+    return;
+  }
   if(!confirm(picked.length+' Stammtisch'+(picked.length===1?'':'e')+' lokal löschen?\n\nAudio, Folien und Text werden entfernt. Beim nächsten Import können sie neu geladen werden.')) return;
   const payload={items:picked.map(function(it){return {kind:it.kind,id:it.id};})};
   const r=await fetch('/api/va/item/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
@@ -670,6 +682,7 @@ async function deleteVaSelected(){
   vaItems=vaItems.filter(function(it){ return !gone[vaKey(it)]; });
   vaColsFitted=false;
   renderVaList();
+  if(hint) hint.textContent=(d.deleted||[]).length+' gelöscht';
 }
 function fmtEta(sec){
   if(sec==null||sec==='') return '';
@@ -790,9 +803,22 @@ async function tickImport(){
   const stop=document.getElementById('btnImpStop');
   if(btn) btn.disabled=running;
   if(stop) stop.disabled=!running;
-  const p=s.progress||{};
-  setJob('impjob', running || ((p.pct||0)>0 && (p.pct||0)<100), p.pct||0, (p.status||'')+(p.eta_sec!=null&&running?(' · '+fmtEta(p.eta_sec)):''));
-  if(p.status) document.getElementById('impstatus').textContent=p.status;
+  let p=s.progress||{};
+  const ap=s.audio_prep||{};
+  if(running && (s.phase==='convert'||s.phase==='apply') && ap.running){
+    const fpAp=parseInt(ap.file_pct,10)||0;
+    const pctAp=parseInt(ap.pct,10)||0;
+    const pctImp=parseInt(p.pct,10)||0;
+    p={
+      status: ap.status||p.status||'Wandle Audio …',
+      pct: Math.max(pctImp, pctAp, fpAp ? Math.min(99, 90 + Math.floor(fpAp / 10)) : 0),
+      file_pct: fpAp || p.file_pct || 0,
+      eta_sec: p.eta_sec!=null ? p.eta_sec : ap.eta_sec
+    };
+  }
+  const fp=(p.file_pct!=null&&p.file_pct!=='')?(' · Datei '+p.file_pct+'%'):'';
+  setJob('impjob', running || ((p.pct||0)>0 && (p.pct||0)<100), p.pct||0, (p.status||'')+fp+(p.eta_sec!=null&&running?(' · '+fmtEta(p.eta_sec)):''));
+  if(p.status||running) document.getElementById('impstatus').textContent=(p.status||'')+fp;
   if(s.error) document.getElementById('imperr').textContent=s.error;
   if(!running && s.preview_ready && s.preview && !window._impPrev){
     window._impPrev=true;

@@ -529,25 +529,46 @@ def convert_pending(
                     total,
                     item.get("titel") or item.get("id"),
                 )
-            if progress_cb:
-                progress_cb(
-                    {
-                        "status": prep.status,
-                        "pct": prep.pct,
-                        "eta_sec": eta,
-                        "current": index,
-                        "total": total,
-                    }
-                )
+            done_flag = {"ok": False}
+
+            def _emit_progress():
+                with prep.lock:
+                    fp = int(prep.file_pct or 0)
+                    st = prep.status or ""
+                pct = int(round(100.0 * ((index - 1) + fp / 100.0) / max(1, total)))
+                payload = {
+                    "status": st,
+                    "pct": min(99, pct),
+                    "file_pct": fp,
+                    "eta_sec": eta,
+                    "current": index,
+                    "total": total,
+                }
+                if progress_cb:
+                    progress_cb(payload)
+
+            def _pump():
+                while not done_flag["ok"]:
+                    _emit_progress()
+                    time.sleep(0.4)
+
+            _emit_progress()
+            pump = threading.Thread(target=_pump, daemon=True)
+            pump.start()
             dur = item.get("dauer_sek")
             try:
                 dur_f = float(dur) if dur is not None else 0.0
             except (TypeError, ValueError):
                 dur_f = 0.0
-            if _to_m4a(path, play_cache_path(path), prep, duration_sec=dur_f):
-                done += 1
-            else:
-                failed += 1
+            try:
+                if _to_m4a(path, play_cache_path(path), prep, duration_sec=dur_f):
+                    done += 1
+                else:
+                    failed += 1
+            finally:
+                done_flag["ok"] = True
+                pump.join(timeout=2)
+                _emit_progress()
         with prep.lock:
             prep.running = False
             prep.done = done
@@ -612,7 +633,13 @@ def find_audio(kind: str, item_id: str, root: Optional[str] = None) -> Optional[
             else:
                 others.append(path)
     hits = preferred or others
-    return hits[0] if hits else None
+    if hits:
+        hits.sort(key=lambda p: (0 if os.path.splitext(p)[1].lower() in WEBKIT_SAFE_EXT else 1, p.lower()))
+        return hits[0]
+    cache = os.path.join(folder, PLAY_CACHE_NAME)
+    if os.path.isfile(cache) and os.path.getsize(cache) > 2:
+        return cache
+    return None
 
 
 def convert_if_needed(
@@ -620,13 +647,14 @@ def convert_if_needed(
     item_id: str,
     root: Optional[str] = None,
     duration_sec: Optional[float] = None,
+    prep: Optional[AudioPrep] = None,
 ) -> bool:
     path = find_audio(kind, item_id, root)
     if not path:
         return True
-    if not needs_audio_convert(path):
+    if os.path.basename(path).lower() == PLAY_CACHE_NAME or not needs_audio_convert(path):
         return True
-    return _to_m4a(path, play_cache_path(path), duration_sec=duration_sec)
+    return _to_m4a(path, play_cache_path(path), prep=prep, duration_sec=duration_sec)
 
 
 def list_folien(kind: str, item_id: str, root: Optional[str] = None) -> list:

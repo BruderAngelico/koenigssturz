@@ -10,3 +10,7 @@ beweissicherung_*/
 beweissicherung_testrun_*/
 vereinsarchiv/
 dist/
+macos/pydeps/
+macos/pydeps-reader/
+macos/build/
+audio.play.m4a

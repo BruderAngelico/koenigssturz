@@ -13,6 +13,7 @@ import requests
 import kingfall as kf
 from kingfall_va_store import (
     AUDIO_EXT,
+    AUDIO_PREP,
     HUGE_FIELDS,
     KINDS,
     LIST_SELECT,
@@ -20,9 +21,14 @@ from kingfall_va_store import (
     SAFE_ID,
     UI_DROP,
     VA_DIRNAME,
+    JobCancelled,
     _atomic_json,
     _file_ok,
+    convert_pending,
+    delete_item,
+    delete_items,
     find_audio,
+    folie_media,
     folie_path,
     is_complete,
     item_folder,
@@ -30,11 +36,18 @@ from kingfall_va_store import (
     item_json_path,
     item_meta_path,
     kind_dir,
+    list_folien,
     list_local,
     load_local_json,
     meta_from_row,
+    needs_audio_convert,
+    open_local_file,
+    playback_audio,
+    prepare_playback,
+    sanitize_filename,
     sanitize_id,
     save_row,
+    start_convert_pending,
     strip_huge,
     va_root,
 )
@@ -400,27 +413,145 @@ def download_audio(
     raise RuntimeError("Audio nicht gefunden: %s (%s)" % (audio_pfad, item_id))
 
 
+DEFAULT_FOLIEN_NAMES = (
+    "folie.pdf",
+    "folien.pdf",
+    "praesentation.pdf",
+    "presentation.pdf",
+    "slides.pdf",
+    "folie.pptx",
+    "folien.pptx",
+)
+
+
 def _folien_paths(folien: Any) -> list:
     paths = []
-    if isinstance(folien, str) and "/" in folien and " " not in folien.strip():
-        paths.append(folien.strip())
+
+    def _take(value: Any) -> None:
+        if not isinstance(value, str):
+            return
+        text = value.strip()
+        if not text:
+            return
+        if text in paths:
+            return
+        paths.append(text)
+
+    if isinstance(folien, str):
+        _take(folien)
     elif isinstance(folien, list):
         for item in folien:
-            if isinstance(item, str) and "/" in item:
-                paths.append(item.strip())
+            if isinstance(item, str):
+                _take(item)
             elif isinstance(item, dict):
-                for key in ("pfad", "path", "audio_pfad", "url"):
-                    value = item.get(key)
-                    if isinstance(value, str) and value.strip():
-                        paths.append(value.strip())
+                for key in ("pfad", "path", "url", "file", "datei", "filename", "name"):
+                    if item.get(key):
+                        _take(item.get(key))
                         break
     elif isinstance(folien, dict):
-        for key in ("pfad", "path", "url"):
-            value = folien.get(key)
-            if isinstance(value, str) and value.strip():
-                paths.append(value.strip())
+        for key in ("pfad", "path", "url", "file", "datei", "filename"):
+            if folien.get(key):
+                _take(folien.get(key))
                 break
     return paths
+
+
+def _folien_missing(kind: str, item_id: str, folien: Any, root: str, audio_pfad: Any = None) -> bool:
+    wanted = _folien_paths(folien)
+    have = {name.lower() for name in list_folien(kind, item_id, root)}
+    if wanted:
+        if not have:
+            return True
+        for path in wanted:
+            base = os.path.basename(path.replace("\\", "/").split("?")[0]).lower()
+            if base and base in have:
+                continue
+            return True
+        return False
+    if not audio_pfad and not have:
+        return True
+    return False
+
+
+def _compare_row(kind: str, row: dict, root: str) -> dict:
+    item_id = str(row.get("id") or "")
+    audio_pfad = row.get("audio_pfad") or None
+    json_ok = _file_ok(item_json_path(kind, item_id, root)) if item_id else False
+    audio_ok = find_audio(kind, item_id, root) is not None if item_id else False
+    local = load_local_json(kind, item_id, root) if json_ok else None
+    src = local or row
+    folien_missing = _folien_missing(kind, item_id, src.get("folien"), root, audio_pfad) if item_id else False
+    folien_have = bool(list_folien(kind, item_id, root)) if item_id else False
+    if not item_id or not SAFE_ID.match(item_id):
+        stand = "fehler"
+        need = False
+    elif not json_ok:
+        stand = "neu"
+        need = True
+    elif audio_pfad and not audio_ok:
+        stand = "audio"
+        need = True
+    elif folien_missing:
+        stand = "folien"
+        need = True
+    else:
+        stand = "ok"
+        need = False
+    return {
+        "id": item_id,
+        "kind": kind,
+        "datum": row.get("datum") or (local or {}).get("datum") or "",
+        "titel": row.get("titel") or (local or {}).get("titel") or item_id,
+        "ort": row.get("ort") or (local or {}).get("ort") or "",
+        "dauer_sek": row.get("dauer_sek") if row.get("dauer_sek") is not None else (local or {}).get("dauer_sek"),
+        "has_audio": audio_ok,
+        "has_folien": folien_have,
+        "remote_audio": bool(audio_pfad),
+        "stand": stand,
+        "need": need,
+    }
+
+
+def compare_kinds(
+    base: str,
+    headers: dict,
+    kinds: list,
+    should_stop: StopFn = None,
+    progress_cb: ProgressCb = None,
+    cwd: Optional[str] = None,
+) -> dict:
+    root = va_root(cwd)
+    selected = [k for k in kinds if k in KINDS]
+    lists = {}
+    items = []
+    counts = {"remote": 0, "neu": 0, "audio": 0, "folien": 0, "ok": 0, "fehler": 0, "need": 0}
+    for kind in selected:
+        if should_stop and should_stop():
+            break
+        if progress_cb:
+            progress_cb(
+                _progress_payload(
+                    {"total": 0, "done": 0, "skipped": 0, "failed": 0, "audio_bytes": 0},
+                    kind,
+                    "listing",
+                    "Lade Liste (%s) …" % KINDS[kind]["label"],
+                )
+            )
+        lists[kind] = fetch_list(base, headers, kind, should_stop)
+    for kind in selected:
+        for row in lists.get(kind) or []:
+            if should_stop and should_stop():
+                break
+            item = _compare_row(kind, row if isinstance(row, dict) else {}, root)
+            items.append(item)
+            counts["remote"] += 1
+            key = item.get("stand") or "fehler"
+            if key in counts:
+                counts[key] += 1
+            if item.get("need"):
+                counts["need"] += 1
+    items.sort(key=lambda x: (x.get("datum") or "", x.get("id") or ""), reverse=True)
+    return {"items": items, "counts": counts, "lists": lists}
 
 
 def download_folien(
@@ -434,29 +565,65 @@ def download_folien(
     listed_buckets: Optional[list] = None,
 ) -> None:
     folder = os.path.join(item_folder(kind, item_id, root), "folien")
+    item_dir = item_folder(kind, item_id, root)
     buckets = _bucket_order(kind, cache, "folien", listed_buckets)
-    for path in _folien_paths(folien):
-        if path.startswith("http"):
+    paths = _folien_paths(folien)
+    if not paths:
+        paths = list(DEFAULT_FOLIEN_NAMES)
+        paths.append("%s.pdf" % item_id)
+    for path in paths:
+        raw_name = os.path.basename(path.replace("\\", "/").split("?")[0]) or "folie.pdf"
+        try:
+            name = sanitize_filename(raw_name)
+        except ValueError:
+            name = "folie.pdf"
+        dest = os.path.join(folder, name)
+        if _file_ok(dest) or _file_ok(os.path.join(item_dir, name)):
             continue
-        dest = os.path.join(folder, os.path.basename(path.replace("\\", "/")) or "folie")
-        if _file_ok(dest):
-            continue
-        for bucket in buckets:
+        os.makedirs(folder, exist_ok=True)
+        if path.startswith("http://") or path.startswith("https://"):
             try:
-                size = download_object(
-                    base,
-                    headers,
-                    bucket,
-                    path,
-                    dest,
-                    prefer_signed=(kind != "public"),
-                )
-                if size > 0:
-                    cache["%s_folien" % kind] = bucket
-                    save_bucket_cache(root, cache)
-                    break
+                response = requests.get(path, headers=storage_headers(headers), timeout=180, stream=True)
+                try:
+                    if response.status_code in (200, 206):
+                        _write_stream(response, dest)
+                        continue
+                finally:
+                    response.close()
             except Exception:
                 continue
+            continue
+        candidates = []
+        for obj in (
+            path,
+            name,
+            "%s/%s" % (item_id, name),
+            "folien/%s" % name,
+            "%s/folien/%s" % (item_id, name),
+        ):
+            if obj and obj not in candidates:
+                candidates.append(obj)
+        got = False
+        for bucket in buckets:
+            if got:
+                break
+            for obj in candidates:
+                try:
+                    size = download_object(
+                        base,
+                        headers,
+                        bucket,
+                        obj,
+                        dest,
+                        prefer_signed=(kind != "public"),
+                    )
+                    if size > 0:
+                        cache["%s_folien" % kind] = bucket
+                        save_bucket_cache(root, cache)
+                        got = True
+                        break
+                except Exception:
+                    continue
 
 
 def _progress_payload(stats: dict, kind: str, phase: str, current: str, saved: bool = False) -> dict:
@@ -505,6 +672,16 @@ def download_kinds(
         lists[kind] = fetch_list(base, headers, kind, should_stop)
         stats["total"] += len(lists[kind])
 
+    preview = []
+    for kind in selected:
+        for row in lists.get(kind) or []:
+            if isinstance(row, dict):
+                preview.append(_compare_row(kind, row, root))
+    if progress_cb and preview:
+        payload = _progress_payload(stats, selected[0] if selected else "", "plan", "Abgleich fertig")
+        payload["preview"] = preview
+        progress_cb(payload)
+
     for kind in selected:
         for row in lists.get(kind) or []:
             if should_stop and should_stop():
@@ -517,7 +694,10 @@ def download_kinds(
             audio_pfad = row.get("audio_pfad") or None
             json_ok = _file_ok(item_json_path(kind, item_id, root))
             audio_ok = find_audio(kind, item_id, root) is not None
-            if json_ok and (not audio_pfad or audio_ok):
+            local = load_local_json(kind, item_id, root) if json_ok else None
+            folien_src = (local or row).get("folien")
+            folien_ok = not _folien_missing(kind, item_id, folien_src, root, audio_pfad)
+            if json_ok and (not audio_pfad or audio_ok) and folien_ok:
                 stats["skipped"] += 1
                 stats["done"] += 1
                 if progress_cb:
@@ -546,7 +726,7 @@ def download_kinds(
                     stats["audio_bytes"] += size
                     has_audio = True
                     save_row(kind, full, root, True)
-                if full.get("folien"):
+                if full.get("folien") or not audio_pfad:
                     download_folien(
                         base,
                         headers,

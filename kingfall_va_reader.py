@@ -86,6 +86,134 @@ class ReaderState:
         self.lock = threading.Lock()
         self.pending_zip = None
         self.last_message = ""
+        self.imp_running = False
+        self.imp_stop = False
+        self.imp_progress = {}
+        self.imp_error = ""
+        self.imp_preview = None
+        self.imp_result = None
+        self.imp_phase = "idle"
+        self.preview_ready = False
+        self.apply_ready = False
+
+    def snapshot(self):
+        with self.lock:
+            return {
+                "running": self.imp_running,
+                "phase": self.imp_phase,
+                "progress": dict(self.imp_progress),
+                "error": self.imp_error,
+                "preview": self.imp_preview,
+                "result": self.imp_result,
+                "preview_ready": self.preview_ready,
+                "apply_ready": self.apply_ready,
+                "audio_prep": va.AUDIO_PREP.snapshot(),
+            }
+
+    def request_stop(self):
+        with self.lock:
+            self.imp_stop = True
+            self.imp_progress = dict(self.imp_progress)
+            self.imp_progress["status"] = "Stoppe …"
+        va.AUDIO_PREP.request_stop()
+
+    def _progress(self, info):
+        with self.lock:
+            self.imp_progress = dict(info)
+
+    def _stop(self):
+        with self.lock:
+            return self.imp_stop
+
+    def start_preview(self, path):
+        with self.lock:
+            if self.imp_running:
+                raise RuntimeError("Import läuft bereits.")
+            self.imp_running = True
+            self.imp_stop = False
+            self.imp_error = ""
+            self.imp_preview = None
+            self.imp_result = None
+            self.preview_ready = False
+            self.apply_ready = False
+            self.imp_phase = "preview"
+            self.imp_progress = {"status": "Starte …", "pct": 0}
+            self.pending_zip = path
+        threading.Thread(target=self._preview_worker, args=(path,), daemon=True).start()
+
+    def _preview_worker(self, path):
+        try:
+            preview = vapack.preview_import(path, _root(), progress=self._progress, stop=self._stop)
+            with self.lock:
+                self.imp_preview = preview
+                self.preview_ready = True
+                self.imp_progress = {"status": "Geprüft", "pct": 100, "eta_sec": 0}
+        except va.JobCancelled:
+            with self.lock:
+                self.imp_error = ""
+                self.imp_progress = {"status": "Abgebrochen", "pct": 0}
+                self.imp_preview = None
+        except Exception as exc:
+            with self.lock:
+                self.imp_error = str(exc)
+                self.imp_progress = {"status": "Fehler", "pct": 0}
+        finally:
+            with self.lock:
+                self.imp_running = False
+                self.imp_phase = "idle"
+
+    def start_apply(self, mode):
+        with self.lock:
+            path = self.pending_zip
+            if self.imp_running:
+                raise RuntimeError("Import läuft bereits.")
+            if not path:
+                raise RuntimeError("Kein Paket bereit.")
+            self.imp_running = True
+            self.imp_stop = False
+            self.imp_error = ""
+            self.imp_result = None
+            self.apply_ready = False
+            self.imp_phase = "apply"
+            self.imp_progress = {"status": "Übernehme …", "pct": 0}
+        threading.Thread(target=self._apply_worker, args=(path, mode), daemon=True).start()
+
+    def _apply_worker(self, path, mode):
+        try:
+            result = vapack.apply_import(
+                path, dest_root=_root(), on_conflict=mode, progress=self._progress, stop=self._stop
+            )
+            with self.lock:
+                self.imp_result = result
+                self.apply_ready = True
+                if result.get("ok") or result.get("aborted"):
+                    self.pending_zip = None
+            if result.get("ok") or result.get("aborted"):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+            if result.get("ok"):
+                va.convert_pending(root=_root(), progress_cb=self._progress, stop_fn=self._stop)
+                with self.lock:
+                    snap = va.AUDIO_PREP.snapshot()
+                    self.imp_progress = {
+                        "status": snap.get("status") or "Audio bereit",
+                        "pct": 100,
+                        "eta_sec": 0,
+                    }
+        except va.JobCancelled:
+            with self.lock:
+                self.imp_error = ""
+                self.imp_progress = {"status": "Abgebrochen", "pct": 0}
+        except Exception as exc:
+            with self.lock:
+                self.imp_error = str(exc)
+                self.imp_progress = {"status": "Fehler", "pct": 0}
+        finally:
+            with self.lock:
+                self.imp_running = False
+                self.imp_phase = "idle"
 
 
 STATE = ReaderState()
@@ -118,17 +246,41 @@ button.act:disabled{opacity:.55;cursor:not-allowed;}
 .head{font-weight:700;border-bottom:1px solid #c4bfb4;background:#efeae2;position:sticky;top:0;}
 .rowl{border-bottom:1px solid #ddd;}
 .rowl:hover{background:var(--hover);}
-#valist .head,#valist .rowl{grid-template-columns:88px 1.6fr 72px 44px 52px;}
-#valist .rowl span:nth-child(2){overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+#valist{--va-cols:28px 80px 180px 64px 44px 44px 48px;flex:1;min-height:0;overflow:auto;}
+#valist .head,#valist .rowl,#valist div.rowl{grid-template-columns:var(--va-cols)!important;gap:6px;width:max-content;min-width:100%;box-sizing:border-box;}
+#valist .head{display:grid;position:sticky;top:0;z-index:3;}
+#valist .rowl span.vadatum,#valist .rowl span.vaquelle,#valist .rowl span.vaaudio,#valist .rowl span.vadocs,#valist .rowl span.vadauer,#valist .vatitle .t{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;}
+#valist .vasel{overflow:visible;display:flex;align-items:center;justify-content:center;}
+#valist .vatitle{display:flex;align-items:center;gap:6px;min-width:0;overflow:hidden;}
+#valist .vatitle .t{flex:1;min-width:0;}
+.vaconv{flex:0 0 auto;font-weight:700;color:#3d6b99;white-space:nowrap;font-size:11px;}
+#valist .rowl.converting{background:#d5e6f6;}
+#valist .head .vacol{position:relative;padding-right:8px;overflow:visible;min-width:0;display:flex;align-items:center;}
+#valist .head .vacol .vacol-lab{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;flex:1;}
+#valist .head .colres{position:absolute;right:-4px;top:0;bottom:0;width:9px;cursor:col-resize;z-index:5;background:transparent;}
+#valist .head .colres::before{content:"";position:absolute;left:50%;top:3px;bottom:3px;width:1px;background:#8a847a;transform:translateX(-50%);}
+#valist .head .colres:hover::before,#valist .head .colres.drag::before{width:2px;background:#3d6b99;}
+#valist .head .colres:hover,#valist .head .colres.drag{background:rgba(61,107,153,.14);}
+#valist .rowl > span:not(:last-child),#valist .head .vacol:not(:last-child){box-shadow:inset -1px 0 0 #d9d3c8;}
+#valist div.rowl{cursor:pointer;border:none;background:transparent;text-align:left;font:inherit;color:inherit;display:grid;align-items:center;padding:6px 8px;font-size:12px;border-bottom:1px solid #ddd;}
+#valist div.rowl:hover{background:var(--hover);}
+#valist div.rowl.on{background:var(--hover);font-weight:700;}
 #vabody h2{margin:0 0 4px;font-size:16px;}
 #vabody h3{margin:14px 0 6px;font-size:13px;}
-.vaplayer{flex:0 0 auto;background:var(--bg);border-top:1px solid #c4bfb4;padding:8px 0 0;}
-.vaplayer audio{width:100%;}
+.vaplayer{flex:0 0 auto;background:var(--bg);border-top:1px solid #c4bfb4;padding:2px 0 0;}
+.vaplayer audio{width:100%;height:32px;display:block;}
+.vaplayer .err{min-height:0;margin:2px 0 0;}
+.vaplayer .err:empty{display:none;}
+.job{display:none;margin:8px 0;max-width:520px;}
+.job.on{display:block;}
+.job .bar{height:12px;width:100%;background:var(--btn);border:1px solid #c4bfb4;}
+.job .bar i{display:block;height:100%;background:var(--bar);width:0;}
+.job .meta{margin-top:4px;font-style:italic;}
 #vatx .tx{display:grid;grid-template-columns:64px 130px 1fr;gap:6px 10px;font-size:12px;padding:4px 0;border-bottom:1px solid #eee;cursor:pointer;}
 #vatx .tx:hover{background:var(--hover);}
 .bottom{flex:1;display:flex;flex-direction:column;min-height:180px;}
 .split{display:flex;flex:1;min-height:0;gap:0;}
-.tlist{flex:0 0 280px;width:280px;min-width:180px;max-width:70%;display:flex;flex-direction:column;}
+.tlist{flex:0 0 720px;width:720px;min-width:280px;max-width:75%;display:flex;flex-direction:column;}
 .tlist .list{flex:1;min-height:0;}
 .tlist button.rowl{cursor:pointer;border:none;background:transparent;width:100%;text-align:left;font:inherit;color:inherit;}
 .tlist .rowl.on{background:var(--hover);font-weight:700;}
@@ -150,9 +302,11 @@ button.act:disabled{opacity:.55;cursor:not-allowed;}
     <p class="hint">Zip aus Königssturz. Kein cURL, kein Netz. Daten liegen nur im Konto dieses Rechner-Nutzers. Gleiche Einträge werden übersprungen; bei abweichendem Inhalt: abbrechen oder Kopie anlegen.</p>
     <div class="inline">
       <input id="vafile" type="file" accept=".zip,application/zip"/>
-      <button class="act" type="button" onclick="importZip()">Einspielen</button>
+      <button class="act" type="button" id="btnImp" onclick="importZip()">Einspielen</button>
+      <button class="act" type="button" id="btnImpStop" onclick="stopImport()" disabled>Abbrechen</button>
       <span class="status" id="impstatus">Bereit</span>
     </div>
+    <div class="job" id="impjob"><div class="bar"><i id="impbar"></i></div><div class="meta" id="impmeta"></div></div>
     <div class="err" id="imperr"></div>
     <div id="conflictbox">
       <p class="warn" id="conflicttext"></p>
@@ -173,12 +327,15 @@ button.act:disabled{opacity:.55;cursor:not-allowed;}
       </select>
       <label for="vasearch">Suche</label>
       <input id="vasearch" type="text" oninput="renderVaList()" placeholder="Titel, Thema, Datum"/>
+      <button class="act" type="button" onclick="vaSelAllVisible(true)">Alle</button>
+      <button class="act" type="button" onclick="vaSelAllVisible(false)">Keine</button>
+      <button class="act" type="button" id="btnVaDel" onclick="deleteVaSelected()">Auswahl löschen</button>
       <span class="status" id="vahint">Noch keine Stammtische lokal</span>
     </div>
     <div class="split">
       <div class="tlist" id="valistbox">
         <div class="list" id="valist">
-          <div class="head"><span>Datum</span><span>Titel</span><span>Quelle</span><span>Audio</span><span>Dauer</span></div>
+          <div class="head" id="vahead"></div>
           <div id="varows"></div>
         </div>
       </div>
@@ -187,6 +344,8 @@ button.act:disabled{opacity:.55;cursor:not-allowed;}
         <div class="list" id="vabody"></div>
         <div class="vaplayer" id="vaplayer" style="display:none">
           <audio id="vaaudio" controls></audio>
+          <div class="job" id="vaaudiojob"><div class="bar"><i id="vaaudiobar"></i></div><div class="meta" id="vaaudiometa"></div></div>
+          <p class="err" id="vaaudioerr"></p>
         </div>
       </div>
     </div>
@@ -208,13 +367,152 @@ function vaDur(n){
 function vaKindLabel(kind){ return kind==='intern'?'Intern':'Öffentlich'; }
 let vaItems=[];
 let vaOpen=null;
+let vaAbort=null;
+let vaSelected={};
+let vaColsFitted=false;
+let vaColWidths=null;
+const VA_COL_LABELS=['','Datum','Titel','Quelle','Audio','Docs','Dauer'];
+const VA_COL_MIN=[28,72,140,58,44,44,48];
+const VA_COL_MAX=[40,110,260,90,56,56,64];
+let vaConv={running:false,kind:'',id:'',pct:0,file_pct:0,title:''};
+function vaKey(it){ return (it.kind||'')+'/'+(it.id||''); }
+function vaYes(v){ return v?'ja':'–'; }
+function vaConvTitle(st){
+  const raw=(st&&st.status)||'';
+  const m=raw.match(/:\s*(.+)$/);
+  return m?m[1].trim():'';
+}
+function vaConvMatch(it){
+  if(!vaConv.running) return false;
+  if(vaConv.id&&it.id===vaConv.id) return !vaConv.kind||vaConv.kind===it.kind;
+  if(vaConv.title){
+    const t=(it.titel||it.id||'').toLowerCase();
+    if(t&&vaConv.title.toLowerCase().indexOf(t)>=0) return true;
+    if(t&&t.indexOf(vaConv.title.toLowerCase())>=0) return true;
+  }
+  return false;
+}
+function vaConvPct(){
+  return Math.max(0, Math.min(99, vaConv.file_pct||vaConv.pct||0));
+}
+function vaRing(it){
+  if(!vaConvMatch(it)) return '';
+  return '<span class="vaconv">umwandeln '+vaConvPct()+'%</span>';
+}
+function vaApplyCols(){
+  const list=document.getElementById('valist');
+  if(!list) return;
+  if(!vaColWidths||vaColWidths.length!==VA_COL_MIN.length) vaColWidths=VA_COL_MIN.slice();
+  const parts=vaColWidths.map(function(w,i){
+    const lo=VA_COL_MIN[i];
+    const hi=VA_COL_MAX[i]||Math.max(lo*4, 320);
+    const n=Math.max(lo, Math.min(hi, w||lo));
+    vaColWidths[i]=n;
+    return n+'px';
+  });
+  list.style.setProperty('--va-cols', parts.join(' '));
+}
+function vaRenderHead(){
+  const head=document.getElementById('vahead');
+  if(!head) return;
+  head.innerHTML=VA_COL_LABELS.map(function(label,i){
+    const grip=i<VA_COL_LABELS.length-1?'<i class="colres" data-col="'+i+'" title="Breite ziehen"></i>':'';
+    if(i===0) return '<span class="vacol vasel"><input type="checkbox" id="vaSelAll" title="Sichtbare auswählen">'+grip+'</span>';
+    return '<span class="vacol"><span class="vacol-lab">'+esc(label)+'</span>'+grip+'</span>';
+  }).join('');
+  const all=document.getElementById('vaSelAll');
+  if(all){
+    all.onchange=function(){ vaSelAllVisible(!!all.checked); };
+  }
+  head.querySelectorAll('.colres').forEach(function(grip){
+    grip.onmousedown=function(e){
+      e.preventDefault();
+      e.stopPropagation();
+      const idx=parseInt(grip.getAttribute('data-col'),10);
+      if(isNaN(idx)) return;
+      if(!vaColWidths||vaColWidths.length!==VA_COL_MIN.length) vaFitCols(true);
+      const startX=e.clientX;
+      const startW=vaColWidths[idx];
+      grip.classList.add('drag');
+      function move(ev){
+        const hi=VA_COL_MAX[idx]||Math.max(VA_COL_MIN[idx]*4, 480);
+        vaColWidths[idx]=Math.max(VA_COL_MIN[idx], Math.min(hi, startW+(ev.clientX-startX)));
+        vaApplyCols();
+      }
+      function up(){
+        grip.classList.remove('drag');
+        document.removeEventListener('mousemove', move);
+        document.removeEventListener('mouseup', up);
+      }
+      document.addEventListener('mousemove', move);
+      document.addEventListener('mouseup', up);
+    };
+  });
+}
+function vaFitCols(force){
+  if(vaColsFitted && !force) return;
+  const list=document.getElementById('valist');
+  if(!list) return;
+  const widths=VA_COL_MIN.slice();
+  const canvas=document.createElement('canvas');
+  const ctx=canvas.getContext('2d');
+  function grow(i, text, bold){
+    const hi=VA_COL_MAX[i]||320;
+    if(!ctx){ widths[i]=Math.max(widths[i], Math.min(hi, 12*((text||'').length)+18)); return; }
+    ctx.font=(bold?'700 ':'')+'12px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif';
+    widths[i]=Math.max(widths[i], Math.min(hi, Math.ceil(ctx.measureText(text||'').width)+18));
+  }
+  VA_COL_LABELS.forEach(function(label,i){ if(i) grow(i, label, true); });
+  const filter=document.getElementById('vafilter').value;
+  const q=(document.getElementById('vasearch').value||'').toLowerCase().trim();
+  vaItems.filter(function(it){
+    if(filter!=='all' && it.kind!==filter) return false;
+    if(!q) return true;
+    const hay=((it.titel||'')+' '+(it.datum||'')+' '+(it.ort||'')+' '+((it.themen||[]).join(' '))+' '+(it.hinweis||'')).toLowerCase();
+    return hay.indexOf(q)>=0;
+  }).slice(0,200).forEach(function(it){
+    const mark=it.hinweis?' · Kopie':'';
+    grow(1, it.datum||'');
+    grow(2, (it.titel||it.id||'')+mark+(vaConvMatch(it)?' umwandeln 99%':''));
+    grow(3, vaKindLabel(it.kind));
+    grow(4, vaYes(it.has_audio));
+    grow(5, vaYes(it.has_folien));
+    grow(6, vaDur(it.dauer_sek));
+  });
+  vaColWidths=widths;
+  vaColsFitted=true;
+  vaApplyCols();
+}
+function applyVaConv(st){
+  st=st||{};
+  const next={
+    running:!!st.running,
+    kind:st.kind||'',
+    id:st.id||st.item_id||'',
+    pct:st.pct||0,
+    file_pct:st.file_pct||0,
+    title:vaConvTitle(st)
+  };
+  const moved=vaConv.running!==next.running||vaConv.kind!==next.kind||vaConv.id!==next.id||vaConv.title!==next.title;
+  vaConv=next;
+  if(moved){
+    renderVaList();
+    const row=document.querySelector('#varows .rowl.converting');
+    if(row&&row.scrollIntoView) row.scrollIntoView({block:'nearest'});
+    return;
+  }
+  const lab=document.querySelector('#varows .rowl.converting .vaconv');
+  if(lab) lab.textContent='umwandeln '+vaConvPct()+'%';
+}
 async function loadVaLocal(){
   const r=await fetch('/api/va/local');
   const d=await r.json().catch(function(){return [];});
   vaItems=Array.isArray(d)?d:[];
+  vaColsFitted=false;
   renderVaList();
 }
 function renderVaList(){
+  if(!document.getElementById('vahead')||!document.getElementById('vahead').children.length) vaRenderHead();
   const filter=document.getElementById('vafilter').value;
   const q=(document.getElementById('vasearch').value||'').toLowerCase().trim();
   const rows=vaItems.filter(function(it){
@@ -223,21 +521,69 @@ function renderVaList(){
     const hay=((it.titel||'')+' '+(it.datum||'')+' '+(it.ort||'')+' '+((it.themen||[]).join(' '))+' '+(it.hinweis||'')).toLowerCase();
     return hay.indexOf(q)>=0;
   });
-  document.getElementById('vahint').textContent=rows.length?(rows.length+' Stammtische'):'Noch keine Stammtische lokal';
+  const nSel=rows.filter(function(it){return !!vaSelected[vaKey(it)];}).length;
+  document.getElementById('vahint').textContent=rows.length?(rows.length+' Stammtische'+(nSel?' · '+nSel+' gewählt':'')):'Noch keine Stammtische lokal';
   document.getElementById('varows').innerHTML=rows.map(function(it){
+    const key=vaKey(it);
     const on=vaOpen&&vaOpen.kind===it.kind&&vaOpen.id===it.id?' on':'';
+    const conv=vaConvMatch(it)?' converting':'';
     const mark=it.hinweis?' · Kopie':'';
-    return '<button type="button" class="rowl'+on+'" data-kind="'+escAttr(it.kind)+'" data-id="'+escAttr(it.id)+'"><span>'+esc(it.datum||'')+'</span><span>'+esc((it.titel||it.id||'')+mark)+'</span><span>'+esc(vaKindLabel(it.kind))+'</span><span>'+(it.has_audio?'ja':'–')+'</span><span>'+vaDur(it.dauer_sek)+'</span></button>';
+    const checked=vaSelected[key]?' checked':'';
+    return '<div class="rowl'+on+conv+'" data-kind="'+escAttr(it.kind)+'" data-id="'+escAttr(it.id)+'"><span class="vasel"><input type="checkbox" class="vaselbox"'+checked+'></span><span class="vadatum">'+esc(it.datum||'')+'</span><span class="vatitle"><span class="t">'+esc((it.titel||it.id||'')+mark)+'</span>'+vaRing(it)+'</span><span class="vaquelle">'+esc(vaKindLabel(it.kind))+'</span><span class="vaaudio">'+vaYes(it.has_audio)+'</span><span class="vadocs">'+vaYes(it.has_folien)+'</span><span class="vadauer">'+vaDur(it.dauer_sek)+'</span></div>';
   }).join('');
+  const all=document.getElementById('vaSelAll');
+  if(all) all.checked=rows.length>0 && nSel===rows.length;
+  if(!vaColsFitted) vaFitCols(false);
+}
+function vaSelAllVisible(on){
+  const filter=document.getElementById('vafilter').value;
+  const q=(document.getElementById('vasearch').value||'').toLowerCase().trim();
+  vaItems.forEach(function(it){
+    if(filter!=='all' && it.kind!==filter) return;
+    if(q){
+      const hay=((it.titel||'')+' '+(it.datum||'')+' '+(it.ort||'')+' '+((it.themen||[]).join(' '))+' '+(it.hinweis||'')).toLowerCase();
+      if(hay.indexOf(q)<0) return;
+    }
+    if(on) vaSelected[vaKey(it)]=true;
+    else delete vaSelected[vaKey(it)];
+  });
+  renderVaList();
+}
+function vaSelectedItems(){
+  return vaItems.filter(function(it){ return !!vaSelected[vaKey(it)]; });
 }
 async function openVa(kind, id){
   if(!kind||!id) return;
+  if(vaAbort) vaAbort.abort();
+  vaAbort=new AbortController();
+  const token=vaAbort;
   vaOpen={kind:kind,id:id};
   renderVaList();
-  const r=await fetch('/api/va/item?kind='+encodeURIComponent(kind)+'&id='+encodeURIComponent(id));
-  const d=await r.json().catch(function(){return {};});
-  if(!r.ok){ alert(d.detail||'Nicht gefunden'); return; }
-  renderVaDetail(d);
+  try{
+    const r=await fetch('/api/va/item?kind='+encodeURIComponent(kind)+'&id='+encodeURIComponent(id),{signal:token.signal});
+    const d=await r.json().catch(function(){return {};});
+    if(token!==vaAbort) return;
+    if(!r.ok){ alert(d.detail||'Nicht gefunden'); return; }
+    renderVaDetail(d);
+  }catch(e){
+    if(e&&e.name==='AbortError') return;
+  }
+}
+async function showVaTranscript(){
+  if(!vaOpen) return;
+  const box=document.getElementById('vatxmount');
+  const btn=document.getElementById('showtx');
+  if(!box) return;
+  if(btn) btn.disabled=true;
+  try{
+    const r=await fetch('/api/va/item?kind='+encodeURIComponent(vaOpen.kind)+'&id='+encodeURIComponent(vaOpen.id)+'&full=1');
+    const d=await r.json().catch(function(){return {};});
+    if(!r.ok){ alert(d.detail||'Transkript nicht lesbar'); return; }
+    box.innerHTML=vaTxLines(d.transkript||[], d.sprecher||[]);
+    if(btn) btn.style.display='none';
+  }catch(e){
+    if(btn) btn.disabled=false;
+  }
 }
 function vaBlock(title, html){
   if(!html) return '';
@@ -288,25 +634,118 @@ function renderVaDetail(item){
     }), sprecher));
   }
   if(item.folien_dateien&&item.folien_dateien.length){
-    html+=vaBlock('Folien', item.folien_dateien.map(function(f){
-      const href='/api/va/file/'+encodeURIComponent(item.kind)+'/'+encodeURIComponent(item.id)+'/'+encodeURIComponent(f);
-      return '<p><a href="'+href+'" target="_blank" rel="noopener">'+esc(f)+'</a></p>';
+    html+=vaBlock('Folien / Präsentation', item.folien_dateien.map(function(f){
+      const low=(f||'').toLowerCase();
+      const kind=low.indexOf('.pdf')>=0?'PDF':(low.indexOf('.ppt')>=0||low.indexOf('.key')>=0||low.indexOf('.odp')>=0?'Präsentation':'Datei');
+      return '<p><button class="act" type="button" data-kind="'+escAttr(item.kind)+'" data-id="'+escAttr(item.id)+'" data-folie="'+escAttr(f)+'">'+esc(kind)+' öffnen: '+esc(f)+'</button></p>';
     }).join(''));
   }
   const nv=item.nachverfolgung;
   if(nv&&typeof nv==='string'&&nv.trim()) html+=vaBlock('Nachverfolgung','<p>'+esc(nv)+'</p>');
-  if(item.transkript&&item.transkript.length){
-    html+=vaBlock('Transkript', vaTxLines(item.transkript, sprecher));
+  if((item.transkript&&item.transkript.length)||item.transkript_n){
+    const n=(item.transkript&&item.transkript.length)?item.transkript.length:(item.transkript_n||0);
+    html+=vaBlock('Transkript', '<p><button class="act" type="button" id="showtx">Transkript zeigen ('+n+' Absätze)</button></p><div id="vatxmount"></div>');
   }
   document.getElementById('vabody').innerHTML=html;
+  const txBtn=document.getElementById('showtx');
+  if(txBtn) txBtn.onclick=showVaTranscript;
+  armVaAudio(item);
+}
+async function deleteVaSelected(){
+  const picked=vaSelectedItems();
+  if(!picked.length){ alert('Keine Stammtische markiert.'); return; }
+  if(!confirm(picked.length+' Stammtisch'+(picked.length===1?'':'e')+' lokal löschen?\n\nAudio, Folien und Text werden entfernt. Beim nächsten Import können sie neu geladen werden.')) return;
+  const payload={items:picked.map(function(it){return {kind:it.kind,id:it.id};})};
+  const r=await fetch('/api/va/item/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+  const d=await r.json().catch(function(){return {};});
+  if(!r.ok){ alert(d.detail||'Löschen fehlgeschlagen'); return; }
+  const gone={};
+  (d.deleted||payload.items).forEach(function(it){ gone[vaKey(it)]=true; });
+  if(vaOpen && gone[vaKey(vaOpen)]){
+    vaOpen=null;
+    document.getElementById('vabody').innerHTML='';
+    armVaAudio({});
+  }
+  Object.keys(gone).forEach(function(k){ delete vaSelected[k]; });
+  vaItems=vaItems.filter(function(it){ return !gone[vaKey(it)]; });
+  vaColsFitted=false;
+  renderVaList();
+}
+function fmtEta(sec){
+  if(sec==null||sec==='') return '';
+  sec=Math.max(0,parseInt(sec,10)||0);
+  if(sec<60) return 'noch ca. '+sec+' s';
+  return 'noch ca. '+Math.floor(sec/60)+' min '+ (sec%60)+' s';
+}
+function setJob(id, on, pct, text){
+  const box=document.getElementById(id);
+  if(!box) return;
+  box.className=on?'job on':'job';
+  const bar=box.querySelector('i');
+  if(bar) bar.style.width=(pct||0)+'%';
+  const meta=box.querySelector('.meta');
+  if(meta) meta.textContent=text||'';
+}
+let vaAudioPoll=null;
+function armVaAudio(item){
   const player=document.getElementById('vaaudio');
   const wrap=document.getElementById('vaplayer');
-  if(item.has_audio){
-    wrap.style.display='block';
-    player.src='/api/va/audio/'+encodeURIComponent(item.kind)+'/'+encodeURIComponent(item.id);
-  }else{
+  const err=document.getElementById('vaaudioerr');
+  if(vaAudioPoll){ clearInterval(vaAudioPoll); vaAudioPoll=null; }
+  if(player){ player.onerror=null; player.oncanplay=null; }
+  if(!item.has_audio){
     wrap.style.display='none';
+    if(err) err.textContent='';
+    setJob('vaaudiojob', false, 0, '');
+    if(player){ player.removeAttribute('src'); player.load(); }
+    return;
+  }
+  wrap.style.display='block';
+  if(err) err.textContent='';
+  player.oncanplay=function(){ if(err) err.textContent=''; setJob('vaaudiojob', false, 0, ''); };
+  player.onerror=function(){
+    const code=player.error&&player.error.code;
+    if(!code || code===1) return;
+    if(err) err.textContent='Diese Datei kann der Player nicht lesen.';
+  };
+  const src='/api/va/audio/'+encodeURIComponent(item.kind)+'/'+encodeURIComponent(item.id);
+  const opened=item.kind+'/'+item.id;
+  if(item.audio_ready){
+    player.src=src;
+    player.setAttribute('data-id', opened);
+  }else{
     player.removeAttribute('src');
+    player.removeAttribute('data-id');
+    player.load();
+    setJob('vaaudiojob', true, 0, 'Audio wird nach Import/Download für den Player vorbereitet …');
+  }
+  async function tickAudio(){
+    if(!vaOpen||(vaOpen.kind+'/'+vaOpen.id)!==opened) return;
+    const meta=await (await fetch('/api/va/audio/meta?kind='+encodeURIComponent(item.kind)+'&id='+encodeURIComponent(item.id))).json().catch(function(){return {};});
+    const st=await (await fetch('/api/va/audio/prepare')).json().catch(function(){return {};});
+    applyVaConv(st);
+    if(!vaOpen||(vaOpen.kind+'/'+vaOpen.id)!==opened) return;
+    if(meta.ready){
+      if(player.getAttribute('data-id')!==opened){
+        player.src=src;
+        player.setAttribute('data-id', opened);
+      }
+    }
+    if(st.running){
+      setJob('vaaudiojob', true, st.pct||0, (st.status||'Wandle Audio …')+(st.eta_sec!=null?(' · '+fmtEta(st.eta_sec)):''));
+    }else if(!meta.ready){
+      setJob('vaaudiojob', true, 0, 'Audio wird nach Import/Download für den Player vorbereitet …');
+    }else{
+      setJob('vaaudiojob', false, 0, '');
+    }
+    if(meta.ready && !st.running && vaAudioPoll){
+      clearInterval(vaAudioPoll);
+      vaAudioPoll=null;
+    }
+  }
+  tickAudio();
+  if(!item.audio_ready){
+    vaAudioPoll=setInterval(tickAudio, 1200);
   }
 }
 function seekVa(t){
@@ -333,7 +772,8 @@ async function importZip(){
   if(!f){ err.textContent='Bitte eine Zip wählen.'; return; }
   const fd=new FormData();
   fd.append('file', f);
-  document.getElementById('impstatus').textContent='Prüfe Paket …';
+  document.getElementById('impstatus').textContent='Lade Zip …';
+  window._impPrev=false; window._impApply=false;
   const r=await fetch('/api/va/import',{method:'POST',body:fd});
   const d=await r.json().catch(function(){return {};});
   if(!r.ok){
@@ -341,42 +781,81 @@ async function importZip(){
     document.getElementById('impstatus').textContent='Fehler';
     return;
   }
-  if((d.counts&&d.counts.conflict)>0){
-    showConflict(d.conflict||[]);
-    document.getElementById('impstatus').textContent='Unterschiede – bitte wählen';
-    return;
+}
+function stopImport(){ fetch('/api/va/import/stop',{method:'POST'}); }
+async function tickImport(){
+  const s=await (await fetch('/api/va/import/status')).json().catch(function(){return {};});
+  const running=!!s.running;
+  const btn=document.getElementById('btnImp');
+  const stop=document.getElementById('btnImpStop');
+  if(btn) btn.disabled=running;
+  if(stop) stop.disabled=!running;
+  const p=s.progress||{};
+  setJob('impjob', running || ((p.pct||0)>0 && (p.pct||0)<100), p.pct||0, (p.status||'')+(p.eta_sec!=null&&running?(' · '+fmtEta(p.eta_sec)):''));
+  if(p.status) document.getElementById('impstatus').textContent=p.status;
+  if(s.error) document.getElementById('imperr').textContent=s.error;
+  if(!running && s.preview_ready && s.preview && !window._impPrev){
+    window._impPrev=true;
+    const d=s.preview;
+    if((d.counts&&d.counts.conflict)>0){
+      showConflict(d.conflict||[]);
+      document.getElementById('impstatus').textContent='Unterschiede – bitte wählen';
+    }else{
+      resolveConflict('abort');
+    }
   }
-  await resolveConflict('abort');
+  if(!running && s.apply_ready && s.result && !window._impApply){
+    window._impApply=true;
+    hideConflict();
+    const d=s.result;
+    if(d.aborted) document.getElementById('impstatus').textContent=d.message||'Abgebrochen';
+    else { document.getElementById('impstatus').textContent=summarize(d); loadVaLocal(); }
+  }
+  applyVaConv(s.audio_prep);
 }
 async function resolveConflict(mode){
   const err=document.getElementById('imperr');
+  window._impApply=false;
   const r=await fetch('/api/va/import/apply',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({on_conflict:mode})});
   const d=await r.json().catch(function(){return {};});
   hideConflict();
   if(!r.ok){
     err.textContent=d.detail||'Nicht übernommen';
     document.getElementById('impstatus').textContent='Fehler';
-    return;
   }
-  if(d.aborted){
-    document.getElementById('impstatus').textContent=d.message||'Abgebrochen';
-    return;
-  }
-  document.getElementById('impstatus').textContent=summarize(d);
-  loadVaLocal();
 }
 document.getElementById('varows').addEventListener('click', function(ev){
-  const btn=ev.target.closest('button.rowl');
-  if(!btn) return;
-  openVa(btn.getAttribute('data-kind'), btn.getAttribute('data-id'));
+  if(ev.target.closest('.vaselbox')||ev.target.closest('.vasel')){
+    const box=ev.target.closest('.rowl');
+    if(!box) return;
+    const cb=box.querySelector('.vaselbox');
+    if(!cb) return;
+    if(ev.target!==cb) cb.checked=!cb.checked;
+    const key=box.getAttribute('data-kind')+'/'+box.getAttribute('data-id');
+    if(cb.checked) vaSelected[key]=true;
+    else delete vaSelected[key];
+    renderVaList();
+    return;
+  }
+  const row=ev.target.closest('div.rowl');
+  if(!row) return;
+  openVa(row.getAttribute('data-kind'), row.getAttribute('data-id'));
 });
 document.getElementById('vabody').addEventListener('click', function(ev){
+  const btn=ev.target.closest('button[data-folie]');
+  if(btn){
+    ev.preventDefault();
+    fetch('/api/va/file/open',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({kind:btn.getAttribute('data-kind'),id:btn.getAttribute('data-id'),name:btn.getAttribute('data-folie')})})
+      .then(function(r){return r.json().catch(function(){return {};}).then(function(d){if(!r.ok) alert(d.detail||'Datei nicht gefunden');});});
+    return;
+  }
   const row=ev.target.closest('.tx');
   if(!row) return;
   const t=row.getAttribute('data-t');
   if(t==null||t==='') return;
   seekVa(t);
 });
+vaRenderHead();
 (function(){
   const bar=document.getElementById('vasplitbar');
   const box=document.getElementById('valistbox');
@@ -400,6 +879,11 @@ document.getElementById('vabody').addEventListener('click', function(ev){
   });
 })();
 loadVaLocal();
+setInterval(tickImport, 800);
+setInterval(async function(){
+  const st=await (await fetch('/api/va/audio/prepare')).json().catch(function(){return {};});
+  applyVaConv(st);
+}, 500);
 </script>
 </body></html>
 """
@@ -415,7 +899,7 @@ def _root():
 
 @app.get("/", response_class=HTMLResponse)
 def index():
-    return PAGE
+    return HTMLResponse(PAGE, headers={"Cache-Control": "no-store, no-cache, must-revalidate"})
 
 
 @app.get("/api/va/local")
@@ -424,15 +908,30 @@ def api_local():
 
 
 @app.get("/api/va/item")
-def api_item(kind: str, item_id: str = Query(..., alias="id")):
+def api_item(kind: str, item_id: str = Query(..., alias="id"), full: bool = Query(False)):
     if kind not in va.KINDS:
         raise HTTPException(status_code=400, detail="Unbekannte Quelle.")
     try:
-        return va.item_for_ui(kind, item_id, _root())
+        return va.item_for_ui(kind, item_id, _root(), include_transcript=full)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
+
+
+@app.post("/api/va/item/delete")
+def api_item_delete(body: Dict[str, Any]):
+    raw_items = body.get("items")
+    if isinstance(raw_items, list) and raw_items:
+        items = [{"kind": str(it.get("kind") or ""), "id": str(it.get("id") or "")} for it in raw_items if isinstance(it, dict)]
+    else:
+        items = [{"kind": str(body.get("kind") or ""), "id": str(body.get("id") or "")}]
+    if not items:
+        raise HTTPException(status_code=400, detail="Keine Einträge.")
+    out = va.delete_items(items, _root())
+    if not out.get("deleted") and out.get("errors"):
+        raise HTTPException(status_code=400, detail=(out["errors"][0] or {}).get("error") or "Löschen fehlgeschlagen")
+    return out
 
 
 @app.get("/api/va/audio/{kind}/{item_id}")
@@ -446,8 +945,7 @@ def api_audio(kind: str, item_id: str):
     path = va.find_audio(kind, safe, _root())
     if not path:
         raise HTTPException(status_code=404, detail="Keine Audiodatei.")
-    ext = os.path.splitext(path)[1].lower()
-    media = VA_AUDIO_TYPES.get(ext, "application/octet-stream")
+    path, media = va.playback_audio(path)
     return FileResponse(
         path,
         media_type=media,
@@ -466,7 +964,32 @@ def api_file(kind: str, item_id: str, name: str):
         raise HTTPException(status_code=400, detail=str(exc))
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
-    return FileResponse(path, filename=os.path.basename(path))
+    media = va.folie_media(path)
+    return FileResponse(
+        path,
+        media_type=media,
+        filename=os.path.basename(path),
+        content_disposition_type="inline" if media == "application/pdf" else "attachment",
+    )
+
+
+@app.post("/api/va/file/open")
+def api_file_open(body: Dict[str, Any]):
+    kind = str(body.get("kind") or "")
+    item_id = str(body.get("id") or "")
+    name = str(body.get("name") or "")
+    if kind not in va.KINDS:
+        raise HTTPException(status_code=400, detail="Unbekannte Quelle.")
+    try:
+        path = va.folie_path(kind, item_id, name, _root())
+        va.open_local_file(path)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except OSError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {"ok": True}
 
 
 @app.post("/api/va/import")
@@ -483,42 +1006,78 @@ async def api_import(file: UploadFile = File(...)):
     except OSError:
         pass
     try:
-        preview = vapack.preview_import(dest, _root())
+        STATE.start_preview(dest)
     except Exception as exc:
         try:
             os.remove(dest)
         except OSError:
             pass
         raise HTTPException(status_code=400, detail=str(exc))
-    with STATE.lock:
-        if STATE.pending_zip and STATE.pending_zip != dest:
-            try:
-                os.remove(STATE.pending_zip)
-            except OSError:
-                pass
-        STATE.pending_zip = dest
-    return preview
+    return {"ok": True}
+
+
+@app.get("/api/va/import/status")
+def api_import_status():
+    return STATE.snapshot()
+
+
+@app.post("/api/va/import/stop")
+def api_import_stop():
+    STATE.request_stop()
+    return {"ok": True}
 
 
 @app.post("/api/va/import/apply")
 def api_apply(body: Dict[str, Any]):
     mode = str((body or {}).get("on_conflict") or "abort")
-    with STATE.lock:
-        path = STATE.pending_zip
-    if not path or not os.path.isfile(path):
-        raise HTTPException(status_code=400, detail="Kein Paket bereit. Zuerst eine Zip einspielen.")
     try:
-        result = vapack.apply_import(path, dest_root=_root(), on_conflict=mode)
+        STATE.start_apply(mode)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc))
-    if result.get("ok") or result.get("aborted"):
-        with STATE.lock:
-            STATE.pending_zip = None
-        try:
-            os.remove(path)
-        except OSError:
-            pass
-    return result
+    return {"ok": True}
+
+
+@app.get("/api/va/audio/meta")
+def api_va_audio_meta(kind: str, item_id: str = Query(..., alias="id")):
+    if kind not in va.KINDS:
+        raise HTTPException(status_code=400, detail="Unbekannte Quelle.")
+    path = va.find_audio(kind, va.sanitize_id(item_id), _root())
+    if not path:
+        raise HTTPException(status_code=404, detail="Keine Audiodatei.")
+    return {"ready": not va.needs_audio_convert(path)}
+
+
+@app.get("/api/va/audio/prepare")
+def api_va_audio_prepare_status():
+    return va.AUDIO_PREP.snapshot()
+
+
+@app.post("/api/va/audio/prepare")
+def api_va_audio_prepare(body: Dict[str, Any]):
+    kind = str((body or {}).get("kind") or "")
+    item_id = str((body or {}).get("id") or "")
+    if kind not in va.KINDS:
+        raise HTTPException(status_code=400, detail="Unbekannte Quelle.")
+    path = va.find_audio(kind, va.sanitize_id(item_id), _root())
+    if not path:
+        raise HTTPException(status_code=404, detail="Keine Audiodatei.")
+    with va.AUDIO_PREP.lock:
+        va.AUDIO_PREP.kind = kind
+        va.AUDIO_PREP.item_id = item_id
+    threading.Thread(target=va.prepare_playback, args=(path,), daemon=True).start()
+    return {"ok": True}
+
+
+@app.post("/api/va/audio/prepare/stop")
+def api_va_audio_prepare_stop():
+    va.AUDIO_PREP.request_stop()
+    return {"ok": True}
+
+
+def _no_browser():
+    if "--no-browser" in sys.argv:
+        return True
+    return os.environ.get("KINGFALL_NO_BROWSER", "").strip().lower() in ("1", "true", "yes")
 
 
 def serve():
@@ -535,14 +1094,18 @@ def serve():
         sys.exit(1)
     url = "http://%s:%s/" % (HOST, port)
     print("VA Reader: %s" % url)
+    print("KINGFALL_READY url=%s" % url)
     print("Daten: %s" % _root())
     print("Nur für diesen Benutzer, nur localhost.")
+    sys.stdout.flush()
+    va.start_convert_pending(root=_root())
 
-    def _open():
-        time.sleep(0.8)
-        webbrowser.open(url)
+    if not _no_browser():
+        def _open():
+            time.sleep(0.8)
+            webbrowser.open(url)
 
-    threading.Thread(target=_open, daemon=True).start()
+        threading.Thread(target=_open, daemon=True).start()
     uvicorn.run(app, host=HOST, port=port, log_level="warning")
 
 

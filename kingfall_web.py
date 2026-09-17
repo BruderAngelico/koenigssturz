@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import secrets
 import socket
 import ssl
 import sys
@@ -29,6 +30,8 @@ import kingfall_vereinsarchiv as va
 
 HOST = "127.0.0.1"
 PORT_CANDIDATES = (18765, 18080, 19000, 8088, 8000, 8765)
+PACK_LOCK = threading.Lock()
+PACK_FILES: Dict[str, Dict[str, str]] = {}
 VA_AUDIO_TYPES = {
     ".aac": "audio/aac",
     ".m4a": "audio/mp4",
@@ -129,7 +132,14 @@ class WebState:
         self.va_running = False
         self.va_stop = False
         self.va_progress = {}
+        self.va_preview = []
+        self.va_preview_counts = {}
         self.va_local_rev = 0
+        self.pack_running = False
+        self.pack_stop = False
+        self.pack_progress = {}
+        self.pack_error = ""
+        self.pack_url = ""
         threading.Thread(target=self._watchdog, daemon=True).start()
 
     def snapshot(self):
@@ -178,8 +188,15 @@ class WebState:
                 "va_error": self.va_error,
                 "va_running": self.va_running,
                 "va_progress": dict(self.va_progress),
+                "va_preview": list(self.va_preview),
+                "va_preview_counts": dict(self.va_preview_counts),
                 "va_token_status": self._va_token_status(),
                 "va_local_rev": self.va_local_rev,
+                "audio_prep": va.AUDIO_PREP.snapshot(),
+                "pack_running": self.pack_running,
+                "pack_progress": dict(self.pack_progress),
+                "pack_error": self.pack_error,
+                "pack_url": self.pack_url,
             }
 
     def _bar(self, exported, total, status):
@@ -319,6 +336,76 @@ class WebState:
             self.va_status = "Starte Download …"
         threading.Thread(target=self._va_job, args=(selected,), daemon=True).start()
 
+    def start_va_preview(self, kinds, curl=""):
+        if curl and str(curl).strip():
+            self.set_va_curl(curl)
+        with self.lock:
+            if self.va_running:
+                raise RuntimeError("Es läuft bereits ein Vereinsarchiv-Download.")
+            if self.va_auth.seconds_left() < 20:
+                raise RuntimeError(
+                    "Der Token ist abgelaufen. Bitte in den DevTools einen frischen Request kopieren."
+                )
+            selected = [k for k in (kinds or []) if k in va.KINDS]
+            if not selected:
+                raise RuntimeError("Bitte öffentlich und/oder intern ankreuzen.")
+            self.va_stop = False
+            self.va_error = ""
+            self.va_progress = {}
+            self.va_running = True
+            self.va_status = "Lade Online-Liste …"
+        threading.Thread(target=self._va_preview_job, args=(selected,), daemon=True).start()
+
+    def _va_preview_job(self, kinds):
+        try:
+            with self.lock:
+                headers = dict(self.va_headers)
+                base = self.va_base
+                self.va_auth.apply_to_headers(headers)
+
+            def should_stop():
+                return self.va_stop
+
+            def on_progress(info):
+                with self.lock:
+                    self.va_progress = dict(info)
+                    self.va_status = self._va_status_from_progress(info)
+
+            plan = va.compare_kinds(
+                base,
+                headers,
+                kinds,
+                should_stop=should_stop,
+                progress_cb=on_progress,
+            )
+            counts = plan.get("counts") or {}
+            with self.lock:
+                self.va_preview = list(plan.get("items") or [])
+                self.va_preview_counts = dict(counts)
+                if self.va_stop:
+                    self.va_status = "Abgleich abgebrochen"
+                else:
+                    self.va_status = (
+                        "Abgleich · %s online · %s neu · %s Audio fehlt · %s Folien fehlen · %s vollständig"
+                        % (
+                            counts.get("remote") or 0,
+                            counts.get("neu") or 0,
+                            counts.get("audio") or 0,
+                            counts.get("folien") or 0,
+                            counts.get("ok") or 0,
+                        )
+                    )
+                self.va_error = ""
+                self.va_local_rev += 1
+        except Exception as exc:
+            with self.lock:
+                self.va_status = "Fehler"
+                self.va_error = str(exc)
+        finally:
+            with self.lock:
+                self.va_running = False
+                self.va_local_rev += 1
+
     def stop_va(self):
         self.va_stop = True
         self.va_status = "Stoppe …"
@@ -328,6 +415,8 @@ class WebState:
         current = info.get("current") or ""
         if phase == "listing":
             return current
+        if phase == "plan":
+            return current or "Abgleich fertig"
         return "Download %s/%s · %s (übersprungen %s, Fehler %s)" % (
             info.get("done") or 0,
             info.get("total") or 0,
@@ -350,6 +439,10 @@ class WebState:
                 with self.lock:
                     self.va_progress = dict(info)
                     self.va_status = self._va_status_from_progress(info)
+                    preview = info.get("preview")
+                    if preview:
+                        self.va_preview = list(preview)
+                        self.va_local_rev += 1
                     if info.get("saved"):
                         self.va_local_rev += 1
 
@@ -377,6 +470,17 @@ class WebState:
                 self.va_error = "\n".join(errors[:8])
                 self.va_progress = dict(stats)
                 self.va_progress.pop("errors", None)
+            if not self.va_stop:
+                def on_convert(info):
+                    with self.lock:
+                        self.va_status = info.get("status") or "Wandle Audio …"
+                        self.va_progress = dict(info)
+
+                va.convert_pending(stop_fn=should_stop, progress_cb=on_convert)
+                with self.lock:
+                    snap = va.AUDIO_PREP.snapshot()
+                    if not self.va_stop:
+                        self.va_status = (self.va_status or "Fertig") + " · " + (snap.get("status") or "Audio bereit")
         except Exception as exc:
             with self.lock:
                 self.va_status = "Fehler"
@@ -385,6 +489,82 @@ class WebState:
             with self.lock:
                 self.va_running = False
                 self.va_local_rev += 1
+
+    def start_pack(self, kinds, ids, date_from, date_to):
+        with self.lock:
+            if self.pack_running:
+                raise RuntimeError("Paket läuft bereits.")
+            self.pack_running = True
+            self.pack_stop = False
+            self.pack_error = ""
+            self.pack_url = ""
+            self.pack_progress = {"status": "Starte …", "pct": 0, "eta_sec": None}
+        threading.Thread(
+            target=self._pack_worker,
+            args=(kinds, ids, date_from, date_to),
+            daemon=True,
+        ).start()
+
+    def stop_pack(self):
+        with self.lock:
+            self.pack_stop = True
+            self.pack_progress = dict(self.pack_progress)
+            self.pack_progress["status"] = "Stoppe …"
+
+    def _pack_worker(self, kinds, ids, date_from, date_to):
+        handle = tempfile.NamedTemporaryFile(prefix="va-paket-", suffix=".zip", delete=False)
+        handle.close()
+
+        def progress(info):
+            with self.lock:
+                self.pack_progress = dict(info)
+
+        def stop():
+            with self.lock:
+                return self.pack_stop
+
+        try:
+            vapack.build_zip(
+                handle.name,
+                kinds=kinds,
+                date_from=date_from,
+                date_to=date_to,
+                ids=ids,
+                progress=progress,
+                stop=stop,
+            )
+            stamp = datetime.now().strftime("%Y-%m-%d")
+            tags = "-".join(kinds) if kinds else "va"
+            filename = "va-paket_%s_%s.zip" % (stamp, tags)
+            token = secrets.token_hex(16)
+            with PACK_LOCK:
+                PACK_FILES[token] = {"path": handle.name, "filename": filename}
+            with self.lock:
+                self.pack_url = "/api/va/pack/file/%s" % token
+                self.pack_progress = {
+                    "status": "Fertig – Speichern",
+                    "pct": 100,
+                    "eta_sec": 0,
+                }
+        except va.JobCancelled:
+            try:
+                os.remove(handle.name)
+            except OSError:
+                pass
+            with self.lock:
+                self.pack_error = ""
+                self.pack_progress = {"status": "Abgebrochen", "pct": 0, "eta_sec": None}
+        except Exception as exc:
+            try:
+                os.remove(handle.name)
+            except OSError:
+                pass
+            with self.lock:
+                self.pack_error = str(exc)
+                self.pack_progress = {"status": "Fehler", "pct": 0, "eta_sec": None}
+        finally:
+            with self.lock:
+                self.pack_running = False
 
     def login(self, email, password, totp):
         if self.curl.strip():
@@ -1065,7 +1245,8 @@ h1{margin:0;font-size:18px;}
 .tabs button{font:inherit;font-weight:700;background:var(--btn);border:1px solid #c4bfb4;border-bottom:none;padding:8px 16px;cursor:pointer;}
 .tabs button.on{background:var(--bg);position:relative;top:1px;}
 .pane{display:none;flex:1;overflow:auto;padding:10px;}
-.pane.on{display:flex;flex-direction:column;}
+.pane.on{display:flex;flex-direction:column;min-height:0;}
+#va.pane.on{overflow:hidden;}
 fieldset{border:1px solid #c4bfb4;margin:0 0 8px;padding:10px;background:var(--bg);}
 legend{font-weight:700;padding:0 6px;}
 .hint{margin:0 0 8px;color:#333;}
@@ -1075,7 +1256,7 @@ input[type=text],input[type=password],textarea{font:inherit;border:1px solid #c4
 textarea{width:100%;min-height:88px;font-family:ui-monospace,Menlo,Consolas,monospace;}
 .inline input[type=text],.inline input[type=password],.inline input[type=date]{width:180px;}
 #vapack .head,#vapack .rowl{grid-template-columns:28px 88px 1.6fr 72px 44px 52px;}
-#vapack{max-height:220px;}
+#vapack{flex:1;min-height:72px;max-height:none;overflow:auto;}
 #totp{width:70px;}
 #mport{width:60px;}
 button.act{font:inherit;font-weight:700;background:var(--btn);border:1px solid #b8b3a8;padding:6px 12px;cursor:pointer;}
@@ -1104,22 +1285,51 @@ textarea.paused{background:#fff4cc;}
 #va{min-height:0;}
 #analyze{min-height:0;}
 #vacurl{min-height:90px;}
-#valist .head,#valist .rowl{grid-template-columns:88px 1.6fr 72px 44px 52px;}
-#valist .rowl span:nth-child(2){overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+#valist{--va-cols:28px 80px 180px 64px 44px 44px 72px 48px;flex:1;min-height:0;overflow:auto;}
+#valist .head,#valist .rowl,#valist div.rowl{grid-template-columns:var(--va-cols)!important;gap:6px;width:max-content;min-width:100%;box-sizing:border-box;}
+#valist .head{display:grid;position:sticky;top:0;z-index:3;}
+#valist .rowl span.vadatum,#valist .rowl span.vaquelle,#valist .rowl span.vaaudio,#valist .rowl span.vadocs,#valist .rowl span.vastand,#valist .rowl span.vadauer,#valist .vatitle .t{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;}
+#valist .vasel{overflow:visible;display:flex;align-items:center;justify-content:center;}
+#valist .vatitle{display:flex;align-items:center;gap:6px;min-width:0;overflow:hidden;}
+#valist .vatitle .t{flex:1;min-width:0;}
+.vaconv{flex:0 0 auto;font-weight:700;color:#3d6b99;white-space:nowrap;font-size:11px;}
+#valist .rowl.converting{background:#d5e6f6;}
+#valist .head .vacol{position:relative;padding-right:8px;overflow:visible;min-width:0;display:flex;align-items:center;}
+#valist .head .vacol .vacol-lab{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;flex:1;}
+#valist .head .colres{position:absolute;right:-4px;top:0;bottom:0;width:9px;cursor:col-resize;z-index:5;background:transparent;}
+#valist .head .colres::before{content:"";position:absolute;left:50%;top:3px;bottom:3px;width:1px;background:#8a847a;transform:translateX(-50%);}
+#valist .head .colres:hover::before,#valist .head .colres.drag::before{width:2px;background:#3d6b99;}
+#valist .head .colres:hover,#valist .head .colres.drag{background:rgba(61,107,153,.14);}
+#valist .rowl > span:not(:last-child),#valist .head .vacol:not(:last-child){box-shadow:inset -1px 0 0 #d9d3c8;}
+#valist div.rowl{cursor:pointer;border:none;background:transparent;text-align:left;font:inherit;color:inherit;display:grid;align-items:center;padding:6px 8px;font-size:12px;border-bottom:1px solid #ddd;}
+#valist div.rowl:hover{background:var(--hover);}
+#valist div.rowl.on{background:var(--hover);font-weight:700;}
 #vabody h2{margin:0 0 4px;font-size:16px;}
 #vabody h3{margin:14px 0 6px;font-size:13px;}
 #va .agrid .list{flex:1;min-height:0;}
-.vaplayer{flex:0 0 auto;background:var(--bg);border-top:1px solid #c4bfb4;padding:8px 0 0;}
-.vaplayer audio{width:100%;}
+#va fieldset.bottom{flex:1 1 0;min-height:0;overflow:hidden;display:flex;flex-direction:column;}
+#va .split{flex:1;min-height:0;overflow:hidden;}
+#va .tlist{flex:0 0 760px;width:760px;min-width:280px;max-width:75%;}
+#vapack .head,#vapack .rowl{grid-template-columns:28px 88px 1.4fr 64px 44px 44px 48px;}
+#vapackbox{flex:0 0 auto;max-height:min(260px,34vh);overflow:hidden;display:flex;flex-direction:column;min-height:0;}
+.vaplayer{flex:0 0 auto;background:var(--bg);border-top:1px solid #c4bfb4;padding:2px 0 0;}
+.vaplayer audio{width:100%;height:32px;display:block;}
+.vaplayer .err{min-height:0;margin:2px 0 0;}
+.vaplayer .err:empty{display:none;}
+.job{display:none;margin:8px 0;max-width:520px;}
+.job.on{display:block;}
+.job .bar{height:12px;width:100%;background:var(--btn);border:1px solid #c4bfb4;}
+.job .bar i{display:block;height:100%;background:var(--bar);width:0;}
+.job .meta{margin-top:4px;font-style:italic;}
 #vatx .tx{display:grid;grid-template-columns:64px 130px 1fr;gap:6px 10px;font-size:12px;padding:4px 0;border-bottom:1px solid #eee;cursor:pointer;}
 #vatx .tx:hover{background:var(--hover);}
 .bottom{flex:1;display:flex;flex-direction:column;min-height:180px;}
 .split{display:flex;flex:1;min-height:0;gap:0;}
 .tlist{flex:0 0 280px;width:280px;min-width:180px;max-width:70%;display:flex;flex-direction:column;}
 .tlist .list{flex:1;min-height:0;}
-.tlist .head,.tlist .rowl{grid-template-columns:1fr auto;}
+#tlistbox .head,#tlistbox .rowl{grid-template-columns:1fr auto;}
 .tlist button.rowl{cursor:pointer;border:none;background:transparent;width:100%;text-align:left;font:inherit;color:inherit;}
-.tlist .rowl span:first-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+#tlistbox .rowl span:first-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
 .tlist .rowl.on{background:var(--hover);font-weight:700;}
 .splitbar{flex:0 0 6px;width:6px;cursor:col-resize;background:#c4bfb4;align-self:stretch;margin:0 4px;}
 .splitbar:hover,.splitbar.drag{background:var(--bar);}
@@ -1277,10 +1487,11 @@ table.data td.jump{cursor:pointer;text-decoration:underline dotted;}
   </fieldset>
   <fieldset>
     <legend> 2. Stammtische sichern </legend>
-    <p class="hint">Schon vollständige Stammtische (JSON und Audio) werden übersprungen. Kein Zeitstempel-Ordner – alles landet in vereinsarchiv/.</p>
+    <p class="hint">Zuerst Abgleich: Online-Liste holen und mit dem lokalen Ordner vergleichen. Download lädt nur, was fehlt (JSON, Audio, Folien).</p>
     <div class="inline">
       <label><input type="checkbox" id="vakindpublic" checked> Öffentlich</label>
       <label><input type="checkbox" id="vakindintern" checked> Intern</label>
+      <button class="act" id="btnVaPrev" onclick="vaPreview()">Abgleich</button>
       <button class="act" id="btnVaDl" onclick="vaDownload()">Download</button>
       <button class="act" id="btnVaStop" onclick="post('/api/va/stop',{})">Stop</button>
       <span class="status" id="vastatus">Status: Bereit</span>
@@ -1298,12 +1509,15 @@ table.data td.jump{cursor:pointer;text-decoration:underline dotted;}
       </select>
       <label for="vasearch">Suche</label>
       <input id="vasearch" type="text" oninput="renderVaList()" placeholder="Titel, Thema, Datum"/>
+      <button class="act" type="button" onclick="vaSelAllVisible(true)">Alle</button>
+      <button class="act" type="button" onclick="vaSelAllVisible(false)">Keine</button>
+      <button class="act" type="button" id="btnVaDel" onclick="deleteVaSelected()">Auswahl löschen</button>
       <span class="status" id="vahint">Noch keine Stammtische lokal</span>
     </div>
     <div class="split">
       <div class="tlist" id="valistbox">
         <div class="list" id="valist">
-          <div class="head"><span>Datum</span><span>Titel</span><span>Quelle</span><span>Audio</span><span>Dauer</span></div>
+          <div class="head" id="vahead"></div>
           <div id="varows"></div>
         </div>
       </div>
@@ -1312,11 +1526,13 @@ table.data td.jump{cursor:pointer;text-decoration:underline dotted;}
         <div class="list" id="vabody"></div>
         <div class="vaplayer" id="vaplayer" style="display:none">
           <audio id="vaaudio" controls></audio>
+          <div class="job" id="vaaudiojob"><div class="bar"><i id="vaaudiobar"></i></div><div class="meta" id="vaaudiometa"></div></div>
+          <p class="err" id="vaaudioerr"></p>
         </div>
       </div>
     </div>
   </fieldset>
-  <fieldset>
+  <fieldset id="vapackbox">
     <legend> 4. Paket für Reader </legend>
     <p class="hint">Nur was lokal schon geladen ist. Öffentlich und intern kommen zusammen in eine Zip, wenn beides angehakt ist. Datum und Häkchen schränken ein. Die Zip ist unverschlüsselt – privat weitergeben.</p>
     <div class="inline">
@@ -1328,11 +1544,13 @@ table.data td.jump{cursor:pointer;text-decoration:underline dotted;}
       <input id="vapackto" type="date"/>
       <button class="act" type="button" onclick="vaPackCheck(true)">Alle</button>
       <button class="act" type="button" onclick="vaPackCheck(false)">Keine</button>
-      <button class="act" type="button" onclick="packVa()">Paket erzeugen</button>
+      <button class="act" type="button" id="btnPack" onclick="packVa()">Paket erzeugen</button>
+      <button class="act" type="button" id="btnPackStop" onclick="stopPack()" disabled>Abbrechen</button>
       <span class="status" id="vapackhint">Keine lokale Auswahl</span>
     </div>
+    <div class="job" id="packjob"><div class="bar"><i id="packbar"></i></div><div class="meta" id="packmeta"></div></div>
     <div class="list" id="vapack">
-      <div class="head"><span></span><span>Datum</span><span>Titel</span><span>Quelle</span><span>Audio</span><span>Dauer</span></div>
+      <div class="head"><span></span><span>Datum</span><span>Titel</span><span>Quelle</span><span>Audio</span><span>Docs</span><span>Dauer</span></div>
       <div id="vapackrows"></div>
     </div>
     <div class="err" id="vapackerr"></div>
@@ -1533,6 +1751,143 @@ let rec={};
 let lastVaRev=-1;
 let vaItems=[];
 let vaOpen=null;
+let vaAbort=null;
+let vaSelected={};
+let vaColsFitted=false;
+let vaColWidths=null;
+const VA_COL_LABELS=['','Datum','Titel','Quelle','Audio','Docs','Stand','Dauer'];
+const VA_COL_MIN=[28,72,140,58,44,44,52,48];
+const VA_COL_MAX=[40,110,240,90,56,56,80,64];
+let vaConv={running:false,kind:'',id:'',pct:0,file_pct:0,title:''};
+function vaKey(it){ return (it.kind||'')+'/'+(it.id||''); }
+function vaYes(v){ return v?'ja':'–'; }
+function vaConvTitle(st){
+  const raw=(st&&st.status)||'';
+  const m=raw.match(/:\s*(.+)$/);
+  return m?m[1].trim():'';
+}
+function vaConvMatch(it){
+  if(!vaConv.running) return false;
+  if(vaConv.id&&it.id===vaConv.id) return !vaConv.kind||vaConv.kind===it.kind;
+  if(vaConv.title){
+    const t=(it.titel||it.id||'').toLowerCase();
+    if(t&&vaConv.title.toLowerCase().indexOf(t)>=0) return true;
+    if(t&&t.indexOf(vaConv.title.toLowerCase())>=0) return true;
+  }
+  return false;
+}
+function vaConvPct(){
+  return Math.max(0, Math.min(99, vaConv.file_pct||vaConv.pct||0));
+}
+function vaRing(it){
+  if(!vaConvMatch(it)) return '';
+  return '<span class="vaconv">umwandeln '+vaConvPct()+'%</span>';
+}
+function vaApplyCols(){
+  const list=document.getElementById('valist');
+  if(!list) return;
+  if(!vaColWidths||vaColWidths.length!==VA_COL_MIN.length) vaColWidths=VA_COL_MIN.slice();
+  const parts=vaColWidths.map(function(w,i){
+    const lo=VA_COL_MIN[i];
+    const hi=VA_COL_MAX[i]||Math.max(lo*4, 320);
+    const n=Math.max(lo, Math.min(hi, w||lo));
+    vaColWidths[i]=n;
+    return n+'px';
+  });
+  list.style.setProperty('--va-cols', parts.join(' '));
+}
+function vaRenderHead(){
+  const head=document.getElementById('vahead');
+  if(!head) return;
+  head.innerHTML=VA_COL_LABELS.map(function(label,i){
+    const grip=i<VA_COL_LABELS.length-1?'<i class="colres" data-col="'+i+'" title="Breite ziehen"></i>':'';
+    if(i===0) return '<span class="vacol vasel"><input type="checkbox" id="vaSelAll" title="Sichtbare auswählen">'+grip+'</span>';
+    return '<span class="vacol"><span class="vacol-lab">'+esc(label)+'</span>'+grip+'</span>';
+  }).join('');
+  const all=document.getElementById('vaSelAll');
+  if(all){
+    all.onchange=function(){ vaSelAllVisible(!!all.checked); };
+  }
+  head.querySelectorAll('.colres').forEach(function(grip){
+    grip.onmousedown=function(e){
+      e.preventDefault();
+      e.stopPropagation();
+      const idx=parseInt(grip.getAttribute('data-col'),10);
+      if(isNaN(idx)) return;
+      if(!vaColWidths||vaColWidths.length!==VA_COL_MIN.length) vaFitCols(true);
+      const startX=e.clientX;
+      const startW=vaColWidths[idx];
+      grip.classList.add('drag');
+      function move(ev){
+        const hi=VA_COL_MAX[idx]||Math.max(VA_COL_MIN[idx]*4, 480);
+        vaColWidths[idx]=Math.max(VA_COL_MIN[idx], Math.min(hi, startW+(ev.clientX-startX)));
+        vaApplyCols();
+      }
+      function up(){
+        grip.classList.remove('drag');
+        document.removeEventListener('mousemove', move);
+        document.removeEventListener('mouseup', up);
+      }
+      document.addEventListener('mousemove', move);
+      document.addEventListener('mouseup', up);
+    };
+  });
+}
+function vaFitCols(force){
+  if(vaColsFitted && !force) return;
+  const list=document.getElementById('valist');
+  if(!list) return;
+  const widths=VA_COL_MIN.slice();
+  const canvas=document.createElement('canvas');
+  const ctx=canvas.getContext('2d');
+  function grow(i, text, bold){
+    const hi=VA_COL_MAX[i]||320;
+    if(!ctx){ widths[i]=Math.max(widths[i], Math.min(hi, 12*((text||'').length)+18)); return; }
+    ctx.font=(bold?'700 ':'')+'12px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif';
+    widths[i]=Math.max(widths[i], Math.min(hi, Math.ceil(ctx.measureText(text||'').width)+18));
+  }
+  VA_COL_LABELS.forEach(function(label,i){ if(i) grow(i, label, true); });
+  const filter=document.getElementById('vafilter').value;
+  const q=(document.getElementById('vasearch').value||'').toLowerCase().trim();
+  vaItems.filter(function(it){
+    if(filter!=='all' && it.kind!==filter) return false;
+    if(!q) return true;
+    const hay=((it.titel||'')+' '+(it.datum||'')+' '+(it.ort||'')+' '+((it.themen||[]).join(' '))).toLowerCase();
+    return hay.indexOf(q)>=0;
+  }).slice(0,200).forEach(function(it){
+    grow(1, it.datum||'');
+    grow(2, (it.titel||it.id||'')+(vaConvMatch(it)?' umwandeln 99%':''));
+    grow(3, vaKindLabel(it.kind));
+    grow(4, vaYes(it.has_audio));
+    grow(5, vaYes(it.has_folien));
+    grow(6, vaStand(it));
+    grow(7, vaDur(it.dauer_sek));
+  });
+  vaColWidths=widths;
+  vaColsFitted=true;
+  vaApplyCols();
+}
+function applyVaConv(st){
+  st=st||{};
+  const next={
+    running:!!st.running,
+    kind:st.kind||'',
+    id:st.id||st.item_id||'',
+    pct:st.pct||0,
+    file_pct:st.file_pct||0,
+    title:vaConvTitle(st)
+  };
+  const moved=vaConv.running!==next.running||vaConv.kind!==next.kind||vaConv.id!==next.id||vaConv.title!==next.title;
+  vaConv=next;
+  if(moved){
+    renderVaList();
+    const row=document.querySelector('#varows .rowl.converting');
+    if(row&&row.scrollIntoView) row.scrollIntoView({block:'nearest'});
+    return;
+  }
+  const lab=document.querySelector('#varows .rowl.converting .vaconv');
+  if(lab) lab.textContent='umwandeln '+vaConvPct()+'%';
+}
 async function tick(){
   const s=await (await fetch('/api/state')).json();
   document.getElementById('loginstatus').textContent=s.login_status||'Kein Auto-Refresh';
@@ -1593,12 +1948,25 @@ async function tick(){
   document.getElementById('vaerr').textContent=s.va_error||'';
   document.getElementById('btnVaDl').disabled=!!s.va_running;
   document.getElementById('btnVaStop').disabled=!s.va_running;
-  if((s.va_local_rev||0)!==lastVaRev){
+  const prevBtn=document.getElementById('btnVaPrev');
+  if(prevBtn) prevBtn.disabled=!!s.va_running;
+  if(Array.isArray(s.va_preview)&&s.va_preview.length){
+    vaItems=s.va_preview;
+    lastVaRev=s.va_local_rev||0;
+    renderVaList();
+    renderVaPack();
+  }else if((s.va_local_rev||0)!==lastVaRev){
     lastVaRev=s.va_local_rev||0;
     loadVaLocal(true);
   }
+  applyVaConv(s.audio_prep);
+  updatePackJob(s);
 }
 setInterval(tick,1000); tick();
+setInterval(async function(){
+  const st=await (await fetch('/api/va/audio/prepare')).json().catch(function(){return {};});
+  applyVaConv(st);
+}, 500);
 
 function vaKinds(){
   const kinds=[];
@@ -1606,10 +1974,27 @@ function vaKinds(){
   if(document.getElementById('vakindintern').checked) kinds.push('intern');
   return kinds;
 }
+function vaPreview(){
+  const kinds=vaKinds();
+  if(!kinds.length){ alert('Bitte öffentlich und/oder intern ankreuzen.'); return; }
+  post('/api/va/preview',{kinds:kinds,curl:gv('vacurl')});
+}
 function vaDownload(){
   const kinds=vaKinds();
   if(!kinds.length){ alert('Bitte öffentlich und/oder intern ankreuzen.'); return; }
   post('/api/va/download',{kinds:kinds,curl:gv('vacurl')});
+}
+function vaStand(it){
+  const s=it.stand||'';
+  if(s==='neu') return 'neu';
+  if(s==='audio') return 'Audio fehlt';
+  if(s==='folien') return 'Folien fehlen';
+  if(s==='ok') return 'vollständig';
+  if(s==='fehler') return 'Fehler';
+  if(it.has_folien&&it.has_audio) return 'lokal';
+  if(it.has_folien) return 'lokal, PDF';
+  if(it.has_audio) return 'lokal';
+  return 'lokal, ohne Audio';
 }
 function vaDur(n){
   n=parseInt(n,10);
@@ -1629,6 +2014,7 @@ async function loadVaLocal(quiet){
     const r=await fetch('/api/va/local');
     const d=await r.json().catch(function(){return [];});
     vaItems=Array.isArray(d)?d:[];
+    vaColsFitted=false;
     renderVaList();
     renderVaPack();
   }catch(e){
@@ -1636,6 +2022,7 @@ async function loadVaLocal(quiet){
   }
 }
 function renderVaList(){
+  if(!document.getElementById('vahead')||!document.getElementById('vahead').children.length) vaRenderHead();
   const filter=document.getElementById('vafilter').value;
   const q=(document.getElementById('vasearch').value||'').toLowerCase().trim();
   const rows=vaItems.filter(function(it){
@@ -1644,20 +2031,68 @@ function renderVaList(){
     const hay=((it.titel||'')+' '+(it.datum||'')+' '+(it.ort||'')+' '+((it.themen||[]).join(' '))).toLowerCase();
     return hay.indexOf(q)>=0;
   });
-  document.getElementById('vahint').textContent=rows.length?(rows.length+' Stammtische'):'Noch keine Stammtische lokal';
+  const nSel=rows.filter(function(it){return !!vaSelected[vaKey(it)];}).length;
+  document.getElementById('vahint').textContent=rows.length?(rows.length+' Stammtische'+(nSel?' · '+nSel+' gewählt':'')):'Noch keine Stammtische lokal';
   document.getElementById('varows').innerHTML=rows.map(function(it){
+    const key=vaKey(it);
     const on=vaOpen&&vaOpen.kind===it.kind&&vaOpen.id===it.id?' on':'';
-    return '<button type="button" class="rowl'+on+'" data-kind="'+escAttr(it.kind)+'" data-id="'+escAttr(it.id)+'"><span>'+esc(it.datum||'')+'</span><span>'+esc(it.titel||it.id||'')+'</span><span>'+esc(vaKindLabel(it.kind))+'</span><span>'+(it.has_audio?'ja':'–')+'</span><span>'+vaDur(it.dauer_sek)+'</span></button>';
+    const conv=vaConvMatch(it)?' converting':'';
+    const checked=vaSelected[key]?' checked':'';
+    return '<div class="rowl'+on+conv+'" data-kind="'+escAttr(it.kind)+'" data-id="'+escAttr(it.id)+'"><span class="vasel"><input type="checkbox" class="vaselbox"'+checked+'></span><span class="vadatum">'+esc(it.datum||'')+'</span><span class="vatitle"><span class="t">'+esc(it.titel||it.id||'')+'</span>'+vaRing(it)+'</span><span class="vaquelle">'+esc(vaKindLabel(it.kind))+'</span><span class="vaaudio">'+vaYes(it.has_audio)+'</span><span class="vadocs">'+vaYes(it.has_folien)+'</span><span class="vastand">'+esc(vaStand(it))+'</span><span class="vadauer">'+vaDur(it.dauer_sek)+'</span></div>';
   }).join('');
+  const all=document.getElementById('vaSelAll');
+  if(all) all.checked=rows.length>0 && nSel===rows.length;
+  if(!vaColsFitted) vaFitCols(false);
+}
+function vaSelAllVisible(on){
+  const filter=document.getElementById('vafilter').value;
+  const q=(document.getElementById('vasearch').value||'').toLowerCase().trim();
+  vaItems.forEach(function(it){
+    if(filter!=='all' && it.kind!==filter) return;
+    if(q){
+      const hay=((it.titel||'')+' '+(it.datum||'')+' '+(it.ort||'')+' '+((it.themen||[]).join(' '))).toLowerCase();
+      if(hay.indexOf(q)<0) return;
+    }
+    if(on) vaSelected[vaKey(it)]=true;
+    else delete vaSelected[vaKey(it)];
+  });
+  renderVaList();
+}
+function vaSelectedItems(){
+  return vaItems.filter(function(it){ return !!vaSelected[vaKey(it)]; });
 }
 async function openVa(kind, id){
   if(!kind||!id) return;
+  if(vaAbort) vaAbort.abort();
+  vaAbort=new AbortController();
+  const token=vaAbort;
   vaOpen={kind:kind,id:id};
   renderVaList();
-  const r=await fetch('/api/va/item?kind='+encodeURIComponent(kind)+'&id='+encodeURIComponent(id));
-  const d=await r.json().catch(function(){return {};});
-  if(!r.ok){ alert(d.detail||d.error||'Nicht gefunden'); return; }
-  renderVaDetail(d);
+  try{
+    const r=await fetch('/api/va/item?kind='+encodeURIComponent(kind)+'&id='+encodeURIComponent(id),{signal:token.signal});
+    const d=await r.json().catch(function(){return {};});
+    if(token!==vaAbort) return;
+    if(!r.ok){ alert(d.detail||d.error||'Nicht gefunden'); return; }
+    renderVaDetail(d);
+  }catch(e){
+    if(e&&e.name==='AbortError') return;
+  }
+}
+async function showVaTranscript(){
+  if(!vaOpen) return;
+  const box=document.getElementById('vatxmount');
+  const btn=document.getElementById('showtx');
+  if(!box) return;
+  if(btn) btn.disabled=true;
+  try{
+    const r=await fetch('/api/va/item?kind='+encodeURIComponent(vaOpen.kind)+'&id='+encodeURIComponent(vaOpen.id)+'&full=1');
+    const d=await r.json().catch(function(){return {};});
+    if(!r.ok){ alert(d.detail||'Transkript nicht lesbar'); return; }
+    box.innerHTML=vaTxLines(d.transkript||[], d.sprecher||[]);
+    if(btn) btn.style.display='none';
+  }catch(e){
+    if(btn) btn.disabled=false;
+  }
 }
 function vaBlock(title, html){
   if(!html) return '';
@@ -1708,25 +2143,125 @@ function renderVaDetail(item){
     }), sprecher));
   }
   if(item.folien_dateien&&item.folien_dateien.length){
-    html+=vaBlock('Folien', item.folien_dateien.map(function(f){
-      const href='/api/va/file/'+encodeURIComponent(item.kind)+'/'+encodeURIComponent(item.id)+'/'+encodeURIComponent(f);
-      return '<p><a href="'+href+'" target="_blank" rel="noopener">'+esc(f)+'</a></p>';
+    html+=vaBlock('Folien / Präsentation', item.folien_dateien.map(function(f){
+      const low=(f||'').toLowerCase();
+      const kind=low.indexOf('.pdf')>=0?'PDF':(low.indexOf('.ppt')>=0||low.indexOf('.key')>=0||low.indexOf('.odp')>=0?'Präsentation':'Datei');
+      return '<p><button class="act" type="button" data-kind="'+escAttr(item.kind)+'" data-id="'+escAttr(item.id)+'" data-folie="'+escAttr(f)+'">'+esc(kind)+' öffnen: '+esc(f)+'</button></p>';
     }).join(''));
   }
   const nv=item.nachverfolgung;
   if(nv&&typeof nv==='string'&&nv.trim()) html+=vaBlock('Nachverfolgung','<p>'+esc(nv)+'</p>');
-  if(item.transkript&&item.transkript.length){
-    html+=vaBlock('Transkript', vaTxLines(item.transkript, sprecher));
+  if((item.transkript&&item.transkript.length)||item.transkript_n){
+    const n=(item.transkript&&item.transkript.length)?item.transkript.length:(item.transkript_n||0);
+    html+=vaBlock('Transkript', '<p><button class="act" type="button" id="showtx">Transkript zeigen ('+n+' Absätze)</button></p><div id="vatxmount"></div>');
   }
   document.getElementById('vabody').innerHTML=html;
+  const txBtn=document.getElementById('showtx');
+  if(txBtn) txBtn.onclick=showVaTranscript;
+  armVaAudio(item);
+}
+async function deleteVaSelected(){
+  const picked=vaSelectedItems();
+  if(!picked.length){ alert('Keine Stammtische markiert.'); return; }
+  if(!confirm(picked.length+' Stammtisch'+(picked.length===1?'':'e')+' lokal löschen?\n\nAudio, Folien und Text werden entfernt. Beim nächsten Download können sie neu geladen werden.')) return;
+  const payload={items:picked.map(function(it){return {kind:it.kind,id:it.id};})};
+  const r=await fetch('/api/va/item/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+  const d=await r.json().catch(function(){return {};});
+  if(!r.ok){ alert(d.detail||'Löschen fehlgeschlagen'); return; }
+  const gone={};
+  (d.deleted||payload.items).forEach(function(it){ gone[vaKey(it)]=true; });
+  if(vaOpen && gone[vaKey(vaOpen)]){
+    vaOpen=null;
+    document.getElementById('vabody').innerHTML='';
+    armVaAudio({});
+  }
+  Object.keys(gone).forEach(function(k){ delete vaSelected[k]; });
+  vaItems=vaItems.map(function(it){
+    if(!gone[vaKey(it)]) return it;
+    if(it.stand && it.stand!=='lokal'){
+      return Object.assign({},it,{has_audio:false,has_folien:false,stand:'neu',need:true});
+    }
+    return null;
+  }).filter(Boolean);
+  vaColsFitted=false;
+  renderVaList();
+  renderVaPack();
+}
+function fmtEta(sec){
+  if(sec==null||sec==='') return '';
+  sec=Math.max(0,parseInt(sec,10)||0);
+  if(sec<60) return 'noch ca. '+sec+' s';
+  return 'noch ca. '+Math.floor(sec/60)+' min '+ (sec%60)+' s';
+}
+function setJob(id, on, pct, text){
+  const box=document.getElementById(id);
+  if(!box) return;
+  box.className=on?'job on':'job';
+  const bar=box.querySelector('i');
+  if(bar) bar.style.width=(pct||0)+'%';
+  const meta=box.querySelector('.meta');
+  if(meta) meta.textContent=text||'';
+}
+let vaAudioPoll=null;
+function armVaAudio(item){
   const player=document.getElementById('vaaudio');
   const wrap=document.getElementById('vaplayer');
-  if(item.has_audio){
-    wrap.style.display='block';
-    player.src='/api/va/audio/'+encodeURIComponent(item.kind)+'/'+encodeURIComponent(item.id);
-  }else{
+  const err=document.getElementById('vaaudioerr');
+  if(vaAudioPoll){ clearInterval(vaAudioPoll); vaAudioPoll=null; }
+  if(player){ player.onerror=null; player.oncanplay=null; }
+  if(!item.has_audio){
     wrap.style.display='none';
+    if(err) err.textContent='';
+    setJob('vaaudiojob', false, 0, '');
+    if(player){ player.removeAttribute('src'); player.load(); }
+    return;
+  }
+  wrap.style.display='block';
+  if(err) err.textContent='';
+  player.oncanplay=function(){ if(err) err.textContent=''; setJob('vaaudiojob', false, 0, ''); };
+  player.onerror=function(){
+    const code=player.error&&player.error.code;
+    if(!code || code===1) return;
+    if(err) err.textContent='Diese Datei kann der Player nicht lesen.';
+  };
+  const src='/api/va/audio/'+encodeURIComponent(item.kind)+'/'+encodeURIComponent(item.id);
+  const opened=item.kind+'/'+item.id;
+  if(item.audio_ready){
+    player.src=src;
+    player.setAttribute('data-id', opened);
+  }else{
     player.removeAttribute('src');
+    player.removeAttribute('data-id');
+    player.load();
+    setJob('vaaudiojob', true, 0, 'Audio wird nach Import/Download für den Player vorbereitet …');
+  }
+  async function tickAudio(){
+    if(!vaOpen||(vaOpen.kind+'/'+vaOpen.id)!==opened) return;
+    const meta=await (await fetch('/api/va/audio/meta?kind='+encodeURIComponent(item.kind)+'&id='+encodeURIComponent(item.id))).json().catch(function(){return {};});
+    const st=await (await fetch('/api/va/audio/prepare')).json().catch(function(){return {};});
+    applyVaConv(st);
+    if(!vaOpen||(vaOpen.kind+'/'+vaOpen.id)!==opened) return;
+    if(meta.ready){
+      if(player.getAttribute('data-id')!==opened){
+        player.src=src;
+        player.setAttribute('data-id', opened);
+      }
+    }
+    if(st.running){
+      setJob('vaaudiojob', true, st.pct||0, (st.status||'Wandle Audio …')+(st.eta_sec!=null?(' · '+fmtEta(st.eta_sec)):''));
+    }else if(!meta.ready){
+      setJob('vaaudiojob', true, 0, 'Audio wird nach Import/Download für den Player vorbereitet …');
+    }else{
+      setJob('vaaudiojob', false, 0, '');
+    }
+    if(meta.ready && !st.running && vaAudioPoll){
+      clearInterval(vaAudioPoll);
+      vaAudioPoll=null;
+    }
+  }
+  tickAudio();
+  if(!item.audio_ready){
+    vaAudioPoll=setInterval(tickAudio, 1200);
   }
 }
 function seekVa(t){
@@ -1761,15 +2296,39 @@ function renderVaPack(){
   document.getElementById('vapackhint').textContent=rows.length?(rows.length+' lokal passend'):'Nichts lokal für diese Auswahl';
   box.innerHTML=rows.map(function(it){
     const hint=it.hinweis?' title="'+escAttr(it.hinweis)+'"':'';
-    return '<label class="rowl"'+hint+'><span><input type="checkbox" class="vapackcb" data-kind="'+escAttr(it.kind)+'" data-id="'+escAttr(it.id)+'" checked></span><span>'+esc(it.datum||'')+'</span><span>'+esc(it.titel||it.id||'')+'</span><span>'+esc(vaKindLabel(it.kind))+'</span><span>'+(it.has_audio?'ja':'–')+'</span><span>'+vaDur(it.dauer_sek)+'</span></label>';
+    return '<label class="rowl"'+hint+'><span><input type="checkbox" class="vapackcb" data-kind="'+escAttr(it.kind)+'" data-id="'+escAttr(it.id)+'" checked></span><span>'+esc(it.datum||'')+'</span><span>'+esc(it.titel||it.id||'')+'</span><span>'+esc(vaKindLabel(it.kind))+'</span><span>'+vaYes(it.has_audio)+'</span><span>'+vaYes(it.has_folien)+'</span><span>'+vaDur(it.dauer_sek)+'</span></label>';
   }).join('');
 }
 function vaPackCheck(on){
   document.querySelectorAll('.vapackcb').forEach(function(el){ el.checked=!!on; });
 }
+function updatePackJob(s){
+  const running=!!s.pack_running;
+  const p=s.pack_progress||{};
+  const btn=document.getElementById('btnPack');
+  const stop=document.getElementById('btnPackStop');
+  if(btn) btn.disabled=running;
+  if(stop) stop.disabled=!running;
+  const text=(p.status||'')+(p.eta_sec!=null && running?(' · '+fmtEta(p.eta_sec)):'');
+  setJob('packjob', running || (p.pct>0 && p.pct<100), p.pct||0, text);
+  const err=document.getElementById('vapackerr');
+  if(err && s.pack_error) err.textContent=s.pack_error;
+  if(s.pack_url && !running && !window._packSavedUrl){
+    window._packSavedUrl=s.pack_url;
+    const frame=document.getElementById('vapackdl')||document.createElement('iframe');
+    frame.id='vapackdl';
+    frame.style.display='none';
+    if(!frame.parentNode) document.body.appendChild(frame);
+    frame.src=s.pack_url;
+    const hint=document.getElementById('vapackhint');
+    if(hint) hint.textContent='Speichern …';
+  }
+  if(running) window._packSavedUrl='';
+}
 async function packVa(){
   const err=document.getElementById('vapackerr');
   err.textContent='';
+  window._packSavedUrl='';
   const kinds=vaPackKinds();
   if(!kinds.length){ err.textContent='Öffentlich und/oder intern ankreuzen.'; return; }
   const ids=[];
@@ -1778,27 +2337,14 @@ async function packVa(){
   });
   if(!ids.length){ err.textContent='Mindestens einen Stammtisch ankreuzen.'; return; }
   const body={kinds:kinds,date_from:document.getElementById('vapackfrom').value||'',date_to:document.getElementById('vapackto').value||'',ids:ids};
-  try{
-    const r=await fetch('/api/va/pack',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-    const disp=r.headers.get('Content-Disposition')||'';
-    if(!r.ok){
-      const d=await r.json().catch(function(){return {};});
-      err.textContent=d.detail||d.error||'Paket fehlgeschlagen';
-      return;
-    }
-    const blob=await r.blob();
-    let name='va-paket.zip';
-    const m=disp.match(/filename="?([^"]+)"?/i);
-    if(m) name=m[1];
-    const a=document.createElement('a');
-    a.href=URL.createObjectURL(blob);
-    a.download=name;
-    a.click();
-    URL.revokeObjectURL(a.href);
-  }catch(e){
-    err.textContent=String(e);
+  const r=await fetch('/api/va/pack/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  const d=await r.json().catch(function(){return {};});
+  if(!r.ok){
+    const x=d.detail||d.error||'Paket fehlgeschlagen';
+    err.textContent=typeof x==='string'?x:JSON.stringify(x);
   }
 }
+function stopPack(){ fetch('/api/va/pack/stop',{method:'POST'}); }
 
 const FILTER_OPS=[
   {id:'eq',label:'ist'},
@@ -3203,17 +3749,36 @@ function initSplit(){
   bindSplit('vasplitbar','valistbox','vaSplit');
 }
 document.getElementById('varows').addEventListener('click', function(ev){
-  const btn=ev.target.closest('button.rowl');
-  if(!btn) return;
-  openVa(btn.getAttribute('data-kind'), btn.getAttribute('data-id'));
+  if(ev.target.closest('.vaselbox')||ev.target.closest('.vasel')){
+    const box=ev.target.closest('.rowl');
+    if(!box) return;
+    const cb=box.querySelector('.vaselbox');
+    if(!cb) return;
+    if(ev.target!==cb) cb.checked=!cb.checked;
+    const key=box.getAttribute('data-kind')+'/'+box.getAttribute('data-id');
+    if(cb.checked) vaSelected[key]=true;
+    else delete vaSelected[key];
+    renderVaList();
+    return;
+  }
+  const row=ev.target.closest('div.rowl');
+  if(!row) return;
+  openVa(row.getAttribute('data-kind'), row.getAttribute('data-id'));
 });
 document.getElementById('vabody').addEventListener('click', function(ev){
+  const btn=ev.target.closest('button[data-folie]');
+  if(btn){
+    ev.preventDefault();
+    post('/api/va/file/open',{kind:btn.getAttribute('data-kind'),id:btn.getAttribute('data-id'),name:btn.getAttribute('data-folie')});
+    return;
+  }
   const row=ev.target.closest('.tx');
   if(!row) return;
   const t=row.getAttribute('data-t');
   if(t==null||t==='') return;
   seekVa(t);
 });
+vaRenderHead();
 initSplit();
 renderAkteHint();
 ['vapackpublic','vapackintern','vapackfrom','vapackto'].forEach(function(id){
@@ -3230,7 +3795,7 @@ app = FastAPI(title="Königssturz – Beweissicherung")
 
 @app.get("/", response_class=HTMLResponse)
 def index():
-    return PAGE
+    return HTMLResponse(PAGE, headers={"Cache-Control": "no-store, no-cache, must-revalidate"})
 
 
 @app.get("/api/state")
@@ -3470,6 +4035,13 @@ def api_va_curl(body: Dict[str, Any]):
     return _run(lambda: STATE.set_va_curl(body.get("curl") or ""))
 
 
+@app.post("/api/va/preview")
+def api_va_preview(body: Dict[str, Any]):
+    return _run(
+        lambda: STATE.start_va_preview(body.get("kinds") or [], body.get("curl") or "")
+    )
+
+
 @app.post("/api/va/download")
 def api_va_download(body: Dict[str, Any]):
     return _run(
@@ -3488,15 +4060,47 @@ def api_va_local():
 
 
 @app.get("/api/va/item")
-def api_va_item(kind: str, item_id: str = Query(..., alias="id")):
+def api_va_item(kind: str, item_id: str = Query(..., alias="id"), full: bool = Query(False)):
     if kind not in va.KINDS:
         raise HTTPException(status_code=400, detail="Unbekannte Quelle.")
     try:
-        return va.item_for_ui(kind, item_id)
+        return va.item_for_ui(kind, item_id, include_transcript=full)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
+
+
+@app.post("/api/va/item/delete")
+def api_va_item_delete(body: Dict[str, Any]):
+    raw_items = body.get("items")
+    if isinstance(raw_items, list) and raw_items:
+        items = [{"kind": str(it.get("kind") or ""), "id": str(it.get("id") or "")} for it in raw_items if isinstance(it, dict)]
+    else:
+        items = [{"kind": str(body.get("kind") or ""), "id": str(body.get("id") or "")}]
+    if not items:
+        raise HTTPException(status_code=400, detail="Keine Einträge.")
+    out = va.delete_items(items)
+    gone = {(d.get("kind"), d.get("id")) for d in out.get("deleted") or []}
+    with STATE.lock:
+        STATE.va_local_rev += 1
+        if STATE.va_preview and gone:
+            updated = []
+            for it in STATE.va_preview:
+                key = (it.get("kind"), it.get("id"))
+                if key in gone:
+                    row = dict(it)
+                    row["has_audio"] = False
+                    row["has_folien"] = False
+                    row["stand"] = "neu"
+                    row["need"] = True
+                    updated.append(row)
+                else:
+                    updated.append(it)
+            STATE.va_preview = updated
+    if not out.get("deleted") and out.get("errors"):
+        raise HTTPException(status_code=400, detail=(out["errors"][0] or {}).get("error") or "Löschen fehlgeschlagen")
+    return out
 
 
 @app.get("/api/va/audio/{kind}/{item_id}")
@@ -3510,8 +4114,7 @@ def api_va_audio(kind: str, item_id: str):
     path = va.find_audio(kind, safe)
     if not path:
         raise HTTPException(status_code=404, detail="Keine Audiodatei.")
-    ext = os.path.splitext(path)[1].lower()
-    media = VA_AUDIO_TYPES.get(ext, "application/octet-stream")
+    path, media = va.playback_audio(path)
     return FileResponse(
         path,
         media_type=media,
@@ -3530,7 +4133,88 @@ def api_va_file(kind: str, item_id: str, name: str):
         raise HTTPException(status_code=400, detail=str(exc))
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
-    return FileResponse(path, filename=os.path.basename(path))
+    media = va.folie_media(path)
+    return FileResponse(
+        path,
+        media_type=media,
+        filename=os.path.basename(path),
+        content_disposition_type="inline" if media == "application/pdf" else "attachment",
+    )
+
+
+@app.post("/api/va/file/open")
+def api_va_file_open(body: Dict[str, Any]):
+    kind = str(body.get("kind") or "")
+    item_id = str(body.get("id") or "")
+    name = str(body.get("name") or "")
+    if kind not in va.KINDS:
+        raise HTTPException(status_code=400, detail="Unbekannte Quelle.")
+    try:
+        path = va.folie_path(kind, item_id, name)
+        va.open_local_file(path)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except OSError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {"ok": True}
+
+
+@app.post("/api/va/pack/start")
+def api_va_pack_start(body: Dict[str, Any]):
+    kinds = [k for k in (body.get("kinds") or []) if k in va.KINDS]
+    ids = body.get("ids") or None
+    date_from = str(body.get("date_from") or "")
+    date_to = str(body.get("date_to") or "")
+    try:
+        STATE.start_pack(kinds, ids, date_from, date_to)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {"ok": True}
+
+
+@app.post("/api/va/pack/stop")
+def api_va_pack_stop():
+    STATE.stop_pack()
+    return {"ok": True}
+
+
+@app.get("/api/va/audio/meta")
+def api_va_audio_meta(kind: str, item_id: str = Query(..., alias="id")):
+    if kind not in va.KINDS:
+        raise HTTPException(status_code=400, detail="Unbekannte Quelle.")
+    path = va.find_audio(kind, va.sanitize_id(item_id))
+    if not path:
+        raise HTTPException(status_code=404, detail="Keine Audiodatei.")
+    return {"ready": not va.needs_audio_convert(path)}
+
+
+@app.get("/api/va/audio/prepare")
+def api_va_audio_prepare_status():
+    return va.AUDIO_PREP.snapshot()
+
+
+@app.post("/api/va/audio/prepare")
+def api_va_audio_prepare(body: Dict[str, Any]):
+    kind = str((body or {}).get("kind") or "")
+    item_id = str((body or {}).get("id") or "")
+    if kind not in va.KINDS:
+        raise HTTPException(status_code=400, detail="Unbekannte Quelle.")
+    path = va.find_audio(kind, va.sanitize_id(item_id))
+    if not path:
+        raise HTTPException(status_code=404, detail="Keine Audiodatei.")
+    with va.AUDIO_PREP.lock:
+        va.AUDIO_PREP.kind = kind
+        va.AUDIO_PREP.item_id = item_id
+    threading.Thread(target=va.prepare_playback, args=(path,), daemon=True).start()
+    return {"ok": True}
+
+
+@app.post("/api/va/audio/prepare/stop")
+def api_va_audio_prepare_stop():
+    va.AUDIO_PREP.request_stop()
+    return {"ok": True}
 
 
 @app.post("/api/va/pack")
@@ -3539,41 +4223,52 @@ def api_va_pack(body: Dict[str, Any]):
     ids = body.get("ids") or None
     date_from = str(body.get("date_from") or "")
     date_to = str(body.get("date_to") or "")
-    handle = tempfile.NamedTemporaryFile(prefix="va-paket-", suffix=".zip", delete=False)
-    handle.close()
     try:
-        vapack.build_zip(
-            handle.name,
-            kinds=kinds,
-            date_from=date_from,
-            date_to=date_to,
-            ids=ids,
-        )
+        STATE.start_pack(kinds, ids, date_from, date_to)
     except Exception as exc:
-        try:
-            os.remove(handle.name)
-        except OSError:
-            pass
         raise HTTPException(status_code=400, detail=str(exc))
-    stamp = datetime.now().strftime("%Y-%m-%d")
-    tags = "-".join(kinds) if kinds else "va"
-    filename = "va-paket_%s_%s.zip" % (stamp, tags)
+    return {"ok": True, "async": True}
+
+
+@app.get("/api/va/pack/file/{token}")
+def api_va_pack_file(token: str):
+    with PACK_LOCK:
+        info = PACK_FILES.pop(token, None)
+    if not info:
+        raise HTTPException(status_code=404, detail="Paket nicht mehr da. Noch einmal erzeugen.")
+    path = info["path"]
+    filename = info["filename"]
 
     def _cleanup():
         try:
-            os.remove(handle.name)
+            os.remove(path)
         except OSError:
             pass
 
     return FileResponse(
-        handle.name,
+        path,
         media_type="application/zip",
         filename=filename,
         background=BackgroundTask(_cleanup),
     )
 
 
+def _no_browser():
+    if "--no-browser" in sys.argv:
+        return True
+    return os.environ.get("KINGFALL_NO_BROWSER", "").strip().lower() in ("1", "true", "yes")
+
+
+def _apply_data_cwd():
+    root = os.environ.get("KINGFALL_CWD", "").strip()
+    if not root:
+        return
+    os.makedirs(root, exist_ok=True)
+    os.chdir(root)
+
+
 def serve():
+    _apply_data_cwd()
     try:
         import uvicorn
     except ImportError:
@@ -3589,14 +4284,18 @@ def serve():
         sys.exit(1)
     url = "http://%s:%s/" % (HOST, port)
     print("Königssturz: %s" % url)
+    print("KINGFALL_READY url=%s" % url)
     print("Nur localhost. Terminal offen lassen, bis die Sicherung fertig ist.")
     print("Dateien landen in: %s" % os.getcwd())
+    sys.stdout.flush()
+    va.start_convert_pending()
 
-    def _open():
-        time.sleep(0.8)
-        webbrowser.open(url)
+    if not _no_browser():
+        def _open():
+            time.sleep(0.8)
+            webbrowser.open(url)
 
-    threading.Thread(target=_open, daemon=True).start()
+        threading.Thread(target=_open, daemon=True).start()
     uvicorn.run(app, host=HOST, port=port, log_level="warning")
 
 

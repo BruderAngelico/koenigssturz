@@ -22,6 +22,21 @@ python kingfall_web.py
 
 Der Browser öffnet sich von selbst, typischerweise [http://127.0.0.1:18765/](http://127.0.0.1:18765/). Das Terminalfenster offen lassen. Port festlegen: `python kingfall_web.py --port 18765`.
 
+### macOS-Apps
+
+Zwei getrennte Apps: **Königssturz** (Beweissicherung) und **VA Reader** (Pakete lesen). Icons liegen unter `icons/` (PNG-Master + `.icns`).
+
+```text
+chmod +x macos/build.sh
+./macos/build.sh
+open dist/Königssturz.app
+open "dist/VA Reader.app"
+```
+
+Beim ersten Öffnen: Rechtsklick → Öffnen (unsigniert). Königssturz schreibt nach `Dokumente/Königssturz`. Der Reader speichert unter `Library/Application Support/KoenigssturzVAReader`. Es wird das System-`python3` genutzt; die Python-Pakete stecken im jeweiligen App-Bundle.
+
+Die Fachlogik ist plattformneutral (localhost). Die macOS-Hülle liegt in `macos/`; Skizze für Windows-Hüllen in `desktop/README.md`. Überblick der Branch-Änderungen: `docs/BRANCH.md`.
+
 Vier Karteireiter: **Supabase**, **E-Mail (IONOS)**, **Vereinsarchiv**, **Auswertung**.
 
 ## Supabase sichern
@@ -123,7 +138,7 @@ PNG und Befund nutzen die **sichtbaren** Spalten.
 
 ## Dateien und Git
 
-Code: `kingfall.py` (Sicherung), `kingfall_web.py` (Browser-UI), `kingfall_analyze.py` (DuckDB-Auswertung), `kingfall_vereinsarchiv.py` (Download), `kingfall_va_store.py` (lokale Stammtische), `kingfall_va_pack.py` / `kingfall_va_reader.py` (Reader), `requirements.txt`, `requirements-reader.txt`.
+Code: `kingfall.py` (Sicherung), `kingfall_web.py` (Browser-UI), `kingfall_analyze.py` (DuckDB-Auswertung), `kingfall_vereinsarchiv.py` (Download), `kingfall_va_store.py` (lokale Stammtische), `kingfall_va_pack.py` / `kingfall_va_reader.py` (Reader), `kingfall_macos.py` (Desktop-Einstieg), `macos/` (macOS-Apps), `icons/`, `desktop/` (Hinweis Windows), `docs/BRANCH.md`, `requirements.txt`, `requirements-reader.txt`.
 
 Repo: [github.com/bonzei123/koenigssturz](https://github.com/bonzei123/koenigssturz). Die `.gitignore` hält `.venv`, IDE-Kram, alle `beweissicherung_*`-Ordner und `vereinsarchiv/` raus. Nach Code-Änderungen:
 

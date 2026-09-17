@@ -8,6 +8,7 @@ import re
 import socket
 import ssl
 import sys
+import tempfile
 import threading
 import time
 import webbrowser
@@ -19,9 +20,11 @@ import imaplib
 import requests
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, HTMLResponse, Response
+from starlette.background import BackgroundTask
 
 import kingfall as kf
 import kingfall_analyze as ka
+import kingfall_va_pack as vapack
 import kingfall_vereinsarchiv as va
 
 HOST = "127.0.0.1"
@@ -1070,7 +1073,9 @@ legend{font-weight:700;padding:0 6px;}
 .inline label{font-weight:600;}
 input[type=text],input[type=password],textarea{font:inherit;border:1px solid #c4bfb4;background:var(--field);color:var(--fg);padding:4px 6px;}
 textarea{width:100%;min-height:88px;font-family:ui-monospace,Menlo,Consolas,monospace;}
-.inline input[type=text],.inline input[type=password]{width:180px;}
+.inline input[type=text],.inline input[type=password],.inline input[type=date]{width:180px;}
+#vapack .head,#vapack .rowl{grid-template-columns:28px 88px 1.6fr 72px 44px 52px;}
+#vapack{max-height:220px;}
 #totp{width:70px;}
 #mport{width:60px;}
 button.act{font:inherit;font-weight:700;background:var(--btn);border:1px solid #b8b3a8;padding:6px 12px;cursor:pointer;}
@@ -1310,6 +1315,27 @@ table.data td.jump{cursor:pointer;text-decoration:underline dotted;}
         </div>
       </div>
     </div>
+  </fieldset>
+  <fieldset>
+    <legend> 4. Paket für Reader </legend>
+    <p class="hint">Nur was lokal schon geladen ist. Öffentlich und intern kommen zusammen in eine Zip, wenn beides angehakt ist. Datum und Häkchen schränken ein. Die Zip ist unverschlüsselt – privat weitergeben.</p>
+    <div class="inline">
+      <label><input type="checkbox" id="vapackpublic" checked> Öffentlich</label>
+      <label><input type="checkbox" id="vapackintern" checked> Intern</label>
+      <label for="vapackfrom">von</label>
+      <input id="vapackfrom" type="date"/>
+      <label for="vapackto">bis</label>
+      <input id="vapackto" type="date"/>
+      <button class="act" type="button" onclick="vaPackCheck(true)">Alle</button>
+      <button class="act" type="button" onclick="vaPackCheck(false)">Keine</button>
+      <button class="act" type="button" onclick="packVa()">Paket erzeugen</button>
+      <span class="status" id="vapackhint">Keine lokale Auswahl</span>
+    </div>
+    <div class="list" id="vapack">
+      <div class="head"><span></span><span>Datum</span><span>Titel</span><span>Quelle</span><span>Audio</span><span>Dauer</span></div>
+      <div id="vapackrows"></div>
+    </div>
+    <div class="err" id="vapackerr"></div>
   </fieldset>
 </section>
 
@@ -1604,6 +1630,7 @@ async function loadVaLocal(quiet){
     const d=await r.json().catch(function(){return [];});
     vaItems=Array.isArray(d)?d:[];
     renderVaList();
+    renderVaPack();
   }catch(e){
     if(!quiet) alert('Lokale Liste nicht lesbar.');
   }
@@ -1636,12 +1663,27 @@ function vaBlock(title, html){
   if(!html) return '';
   return '<h3>'+esc(title)+'</h3>'+html;
 }
+function vaStamp(v){
+  if(v==null||v==='') return null;
+  if(typeof v==='number') return v>100000?v/1000:v;
+  const t=parseFloat(v);
+  return isNaN(t)?null:t;
+}
+function vaTxLines(list, sprecher){
+  if(!list||!list.length||!list.map) return '';
+  return '<div id="vatx">'+list.map(function(t){
+    const n=vaStamp(t.t!=null?t.t:(t.start!=null?t.start:t.zeit));
+    const name=sprecher[t.sp]!=null?sprecher[t.sp]:(t.sprecher||t.speaker||('Sprecher '+(t.sp==null?'?':t.sp)));
+    return '<div class="tx" data-t="'+(n||0)+'"><span>'+vaDur(n)+'</span><span>'+esc(name)+'</span><span>'+esc(t.text||t.titel||t.title||'')+'</span></div>';
+  }).join('')+'</div>';
+}
 function renderVaDetail(item){
-  const z=item.zusammenfassung||{};
+  const z=item.zusammenfassung&&typeof item.zusammenfassung==='object'?item.zusammenfassung:{};
   const sprecher=item.sprecher||[];
-  const themen=(item.themen||[]).join(', ');
+  const themen=(item.themen||[]).join? (item.themen||[]).join(', ') : '';
   let html='<h2>'+esc(item.titel||item.id||'')+'</h2>';
   html+='<p class="hint">'+esc(vaKindLabel(item.kind))+' · '+esc(item.datum||'')+(item.ort?' · '+esc(item.ort):'')+' · '+vaDur(item.dauer_sek)+(themen?' · '+esc(themen):'')+'</p>';
+  if(item.hinweis) html+='<p class="hint">'+esc(item.hinweis)+'</p>';
   if(z.lead) html+=vaBlock('Kurzfassung','<p>'+esc(z.lead)+'</p>');
   if(z.fragen&&z.fragen.length){
     html+=vaBlock('Fragen', z.fragen.map(function(q){
@@ -1659,11 +1701,22 @@ function renderVaDetail(item){
   if(z.offene_fragen&&z.offene_fragen.length){
     html+=vaBlock('Offene Fragen','<ul>'+z.offene_fragen.map(function(s){return '<li>'+esc(s)+'</li>';}).join('')+'</ul>');
   }
+  if(item.kapitel&&item.kapitel.length&&item.kapitel.map){
+    html+=vaBlock('Kapitel', vaTxLines(item.kapitel.map(function(c){
+      if(typeof c==='string') return {t:0,text:c};
+      return {t:c.t!=null?c.t:c.start, sp:c.sp, text:c.titel||c.title||c.name||c.text||''};
+    }), sprecher));
+  }
+  if(item.folien_dateien&&item.folien_dateien.length){
+    html+=vaBlock('Folien', item.folien_dateien.map(function(f){
+      const href='/api/va/file/'+encodeURIComponent(item.kind)+'/'+encodeURIComponent(item.id)+'/'+encodeURIComponent(f);
+      return '<p><a href="'+href+'" target="_blank" rel="noopener">'+esc(f)+'</a></p>';
+    }).join(''));
+  }
+  const nv=item.nachverfolgung;
+  if(nv&&typeof nv==='string'&&nv.trim()) html+=vaBlock('Nachverfolgung','<p>'+esc(nv)+'</p>');
   if(item.transkript&&item.transkript.length){
-    html+=vaBlock('Transkript','<div id="vatx">'+item.transkript.map(function(t){
-      const name=sprecher[t.sp]!=null?sprecher[t.sp]:('Sprecher '+(t.sp==null?'?':t.sp));
-      return '<div class="tx" data-t="'+(t.t||0)+'"><span>'+vaDur(t.t)+'</span><span>'+esc(name)+'</span><span>'+esc(t.text||'')+'</span></div>';
-    }).join('')+'</div>');
+    html+=vaBlock('Transkript', vaTxLines(item.transkript, sprecher));
   }
   document.getElementById('vabody').innerHTML=html;
   const player=document.getElementById('vaaudio');
@@ -1682,6 +1735,69 @@ function seekVa(t){
   if(!player||isNaN(n)) return;
   try{ player.currentTime=n; }catch(e){}
   if(player.paused) player.play().catch(function(){});
+}
+function vaPackKinds(){
+  const kinds=[];
+  if(document.getElementById('vapackpublic').checked) kinds.push('public');
+  if(document.getElementById('vapackintern').checked) kinds.push('intern');
+  return kinds;
+}
+function vaPackRows(){
+  const kinds=vaPackKinds();
+  const from=document.getElementById('vapackfrom').value||'';
+  const to=document.getElementById('vapackto').value||'';
+  return vaItems.filter(function(it){
+    if(kinds.indexOf(it.kind)<0) return false;
+    const day=(it.datum||'').toString().slice(0,10);
+    if(from && day && day<from) return false;
+    if(to && day && day>to) return false;
+    return true;
+  });
+}
+function renderVaPack(){
+  const rows=vaPackRows();
+  const box=document.getElementById('vapackrows');
+  if(!box) return;
+  document.getElementById('vapackhint').textContent=rows.length?(rows.length+' lokal passend'):'Nichts lokal für diese Auswahl';
+  box.innerHTML=rows.map(function(it){
+    const hint=it.hinweis?' title="'+escAttr(it.hinweis)+'"':'';
+    return '<label class="rowl"'+hint+'><span><input type="checkbox" class="vapackcb" data-kind="'+escAttr(it.kind)+'" data-id="'+escAttr(it.id)+'" checked></span><span>'+esc(it.datum||'')+'</span><span>'+esc(it.titel||it.id||'')+'</span><span>'+esc(vaKindLabel(it.kind))+'</span><span>'+(it.has_audio?'ja':'–')+'</span><span>'+vaDur(it.dauer_sek)+'</span></label>';
+  }).join('');
+}
+function vaPackCheck(on){
+  document.querySelectorAll('.vapackcb').forEach(function(el){ el.checked=!!on; });
+}
+async function packVa(){
+  const err=document.getElementById('vapackerr');
+  err.textContent='';
+  const kinds=vaPackKinds();
+  if(!kinds.length){ err.textContent='Öffentlich und/oder intern ankreuzen.'; return; }
+  const ids=[];
+  document.querySelectorAll('.vapackcb:checked').forEach(function(el){
+    ids.push({kind:el.getAttribute('data-kind'),id:el.getAttribute('data-id')});
+  });
+  if(!ids.length){ err.textContent='Mindestens einen Stammtisch ankreuzen.'; return; }
+  const body={kinds:kinds,date_from:document.getElementById('vapackfrom').value||'',date_to:document.getElementById('vapackto').value||'',ids:ids};
+  try{
+    const r=await fetch('/api/va/pack',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    const disp=r.headers.get('Content-Disposition')||'';
+    if(!r.ok){
+      const d=await r.json().catch(function(){return {};});
+      err.textContent=d.detail||d.error||'Paket fehlgeschlagen';
+      return;
+    }
+    const blob=await r.blob();
+    let name='va-paket.zip';
+    const m=disp.match(/filename="?([^"]+)"?/i);
+    if(m) name=m[1];
+    const a=document.createElement('a');
+    a.href=URL.createObjectURL(blob);
+    a.download=name;
+    a.click();
+    URL.revokeObjectURL(a.href);
+  }catch(e){
+    err.textContent=String(e);
+  }
 }
 
 const FILTER_OPS=[
@@ -3100,6 +3216,10 @@ document.getElementById('vabody').addEventListener('click', function(ev){
 });
 initSplit();
 renderAkteHint();
+['vapackpublic','vapackintern','vapackfrom','vapackto'].forEach(function(id){
+  const el=document.getElementById(id);
+  if(el) el.addEventListener('change', renderVaPack);
+});
 </script>
 </body></html>
 """
@@ -3397,6 +3517,59 @@ def api_va_audio(kind: str, item_id: str):
         media_type=media,
         filename=os.path.basename(path),
         content_disposition_type="inline",
+    )
+
+
+@app.get("/api/va/file/{kind}/{item_id}/{name}")
+def api_va_file(kind: str, item_id: str, name: str):
+    if kind not in va.KINDS:
+        raise HTTPException(status_code=400, detail="Unbekannte Quelle.")
+    try:
+        path = va.folie_path(kind, item_id, name)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    return FileResponse(path, filename=os.path.basename(path))
+
+
+@app.post("/api/va/pack")
+def api_va_pack(body: Dict[str, Any]):
+    kinds = [k for k in (body.get("kinds") or []) if k in va.KINDS]
+    ids = body.get("ids") or None
+    date_from = str(body.get("date_from") or "")
+    date_to = str(body.get("date_to") or "")
+    handle = tempfile.NamedTemporaryFile(prefix="va-paket-", suffix=".zip", delete=False)
+    handle.close()
+    try:
+        vapack.build_zip(
+            handle.name,
+            kinds=kinds,
+            date_from=date_from,
+            date_to=date_to,
+            ids=ids,
+        )
+    except Exception as exc:
+        try:
+            os.remove(handle.name)
+        except OSError:
+            pass
+        raise HTTPException(status_code=400, detail=str(exc))
+    stamp = datetime.now().strftime("%Y-%m-%d")
+    tags = "-".join(kinds) if kinds else "va"
+    filename = "va-paket_%s_%s.zip" % (stamp, tags)
+
+    def _cleanup():
+        try:
+            os.remove(handle.name)
+        except OSError:
+            pass
+
+    return FileResponse(
+        handle.name,
+        media_type="application/zip",
+        filename=filename,
+        background=BackgroundTask(_cleanup),
     )
 
 

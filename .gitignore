@@ -9,3 +9,4 @@ __pycache__/
 beweissicherung_*/
 beweissicherung_testrun_*/
 vereinsarchiv/
+dist/

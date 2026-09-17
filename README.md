@@ -57,6 +57,21 @@ Schon vollständige Stammtische (JSON plus Audio, falls `audio_pfad` gesetzt ist
 
 Unten die lokale Liste: Titel, Kurzfassung, Fragen, Aufgaben, Sachstand, Transkript. Audio spielt aus der lokalen Datei. Klick auf eine Transkriptzeile springt in der Aufnahme an diese Stelle.
 
+Im Abschnitt **Paket für Reader**: nur lokal schon Geladenes (Häkchen, öffentlich/intern, Datum von/bis). **Paket erzeugen** schreibt eine unverschlüsselte Zip zum privaten Weitergeben.
+
+## VA Reader
+
+Eigenständiges Lese-Programm **ohne Königssturz und ohne cURL**. Dieselbe Ansicht wie im Reiter Vereinsarchiv: Liste, Kurzfassung, Fragen, Kapitel (Klick springt in der Aufnahme), Folien, Transkript mit Zeitstempeln.
+
+Einmalig Abhängigkeiten (kleiner als Königssturz):
+
+```text
+python3 -m pip install -r requirements-reader.txt
+python3 kingfall_va_reader.py
+```
+
+Browser: [http://127.0.0.1:18766/](http://127.0.0.1:18766/). Zip aus Königssturz (**Paket für Reader**) einspielen. Gleiche Einträge nicht doppelt. Inhalt anders: **Abbrechen** oder **Kopie speichern**. Daten liegen nur im Ordner dieses Rechner-Nutzers.
+
 ## Auswertung
 
 Oben den Backup-Ordner wählen (Standard: der neueste). Links die Tabellen, rechts die Daten. Die Trennlinie dazwischen lässt sich ziehen.
@@ -108,7 +123,7 @@ PNG und Befund nutzen die **sichtbaren** Spalten.
 
 ## Dateien und Git
 
-Code: `kingfall.py` (Sicherung), `kingfall_web.py` (Browser-UI), `kingfall_analyze.py` (DuckDB-Auswertung), `kingfall_vereinsarchiv.py` (Stammtische + Audio), `requirements.txt`.
+Code: `kingfall.py` (Sicherung), `kingfall_web.py` (Browser-UI), `kingfall_analyze.py` (DuckDB-Auswertung), `kingfall_vereinsarchiv.py` (Download), `kingfall_va_store.py` (lokale Stammtische), `kingfall_va_pack.py` / `kingfall_va_reader.py` (Reader), `requirements.txt`, `requirements-reader.txt`.
 
 Repo: [github.com/bonzei123/koenigssturz](https://github.com/bonzei123/koenigssturz). Die `.gitignore` hält `.venv`, IDE-Kram, alle `beweissicherung_*`-Ordner und `vereinsarchiv/` raus. Nach Code-Änderungen:
 

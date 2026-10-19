@@ -1,0 +1,41 @@
+{
+  "name": "raetegruen",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Platzhalter-Auftritt Rätegrün. Informativ, ohne Verkauf und ohne Tracking.",
+  "scripts": {
+    "dev": "NEXT_TELEMETRY_DISABLED=1 next dev --turbopack",
+    "build": "NEXT_TELEMETRY_DISABLED=1 next build --turbopack",
+    "start": "NEXT_TELEMETRY_DISABLED=1 next start",
+    "lint": "eslint"
+  },
+  "dependencies": {
+    "@hookform/resolvers": "^3.10.0",
+    "@radix-ui/react-accordion": "^1.3.1",
+    "@radix-ui/react-checkbox": "^1.4.1",
+    "@radix-ui/react-dialog": "^1.3.1",
+    "@radix-ui/react-label": "^2.1.17",
+    "@radix-ui/react-slot": "^1.5.0",
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
+    "framer-motion": "^14.4.0",
+    "lucide-react": "^1.59.0",
+    "next": "15.5.28",
+    "react": "19.1.0",
+    "react-dom": "19.1.0",
+    "react-hook-form": "^7.90.0",
+    "tailwind-merge": "^3.7.0",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@eslint/eslintrc": "^3",
+    "@tailwindcss/postcss": "^4",
+    "@types/node": "^20",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "eslint": "^9",
+    "eslint-config-next": "15.5.28",
+    "tailwindcss": "^4",
+    "typescript": "^5"
+  }
+}

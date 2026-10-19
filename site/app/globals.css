@@ -1,0 +1,155 @@
+@import "tailwindcss";
+
+/* Class-based dark mode. The header toggle writes .dark on <html>. */
+@custom-variant dark (&:where(.dark, .dark *));
+
+:root {
+  --paper: #f4efe6;
+  --charcoal: #111111;
+  --red: #c8102e;
+  --hemp: #1f4d2b;
+  --leaf: #4c9a2a;
+  --signal: #f2c300;
+  --background: #f4efe6;
+  --foreground: #111111;
+  --surface: #f4efe6;
+  --surface-2: #e7e0d4;
+  --ink: #111111;
+  --muted: #3a342c;
+  --line: #111111;
+  --shadow: #111111;
+  color-scheme: light;
+}
+
+.dark {
+  --background: #111111;
+  --foreground: #f4efe6;
+  --surface: #171717;
+  --surface-2: #1c1c1c;
+  --ink: #f4efe6;
+  --muted: #d4cbbc;
+  --line: #f4efe6;
+  --shadow: #f4efe6;
+  color-scheme: dark;
+}
+
+@theme inline {
+  --color-paper: #f4efe6;
+  --color-charcoal: #111111;
+  --color-resistance: #c8102e;
+  --color-hemp: #1f4d2b;
+  --color-leaf: #4c9a2a;
+  --color-signal: #f2c300;
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-surface: var(--surface);
+  --color-surface-2: var(--surface-2);
+  --color-ink: var(--ink);
+  --color-muted: var(--muted);
+  --color-line: var(--line);
+  --font-sans: var(--font-space), "Segoe UI", sans-serif;
+  --font-display: var(--font-anton), "Arial Narrow", Impact, sans-serif;
+}
+
+@utility shadow-hard {
+  box-shadow: 6px 6px 0 0 var(--shadow);
+}
+
+@utility shadow-hard-sm {
+  box-shadow: 3px 3px 0 0 var(--shadow);
+}
+
+/* Hemp on cream passes AA. Leaf on charcoal passes AA. Hemp on charcoal does not. */
+@utility text-brand {
+  color: var(--hemp);
+}
+
+.dark .text-brand {
+  color: var(--leaf);
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  min-height: 100%;
+  background-color: var(--background);
+  color: var(--ink);
+  font-family: var(--font-space), "Segoe UI", sans-serif;
+  background-image: radial-gradient(rgb(17 17 17 / 0.045) 0.7px, transparent 0.7px);
+  background-size: 3px 3px;
+  hyphens: auto;
+}
+
+.dark body {
+  background-image: radial-gradient(rgb(244 239 230 / 0.05) 0.7px, transparent 0.7px);
+}
+
+h1,
+h2,
+h3 {
+  text-wrap: balance;
+  hyphens: manual;
+}
+
+:focus-visible {
+  outline: 3px solid var(--ink);
+  outline-offset: 3px;
+}
+
+::selection {
+  background: #c8102e;
+  color: #f4efe6;
+}
+
+[id] {
+  scroll-margin-top: 6rem;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .lift:hover {
+    transform: translate(-2px, -2px);
+  }
+}
+
+@keyframes accordion-down {
+  from {
+    height: 0;
+  }
+  to {
+    height: var(--radix-accordion-content-height);
+  }
+}
+
+@keyframes accordion-up {
+  from {
+    height: var(--radix-accordion-content-height);
+  }
+  to {
+    height: 0;
+  }
+}
+
+.accordion-content[data-state="open"] {
+  animation: accordion-down 0.2s ease-out;
+}
+
+.accordion-content[data-state="closed"] {
+  animation: accordion-up 0.2s ease-out;
+}

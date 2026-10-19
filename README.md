@@ -1,5 +1,7 @@
 # Königssturz
 
+Im Ordner [`site/`](site/README.md) liegt zusätzlich der Platzhalter-Auftritt **Rätegrün** (Next.js). Die Python-Werkzeuge darunter bleiben eigenständig. Start der Website: `cd site && npm install && npm run dev`.
+
 Lokale Beweissicherung für eine Supabase-Datenbank und ein IONOS-Postfach, plus Auswertung der gesicherten Dateien im Browser. Zusätzlich lädt der Karteireiter **Vereinsarchiv** Stammtische (öffentlich und intern) samt Audio lokal herunter. Es läuft nur auf deinem Rechner (`127.0.0.1`). Nichts wird in die Cloud geschickt, außer du pushst selbst nach GitHub.
 
 Die Sicherungen liegen als Ordner neben dem Programm, Namen wie `beweissicherung_2026-…`. Git ignoriert diese Ordner absichtlich: darin stehen Personen-, Rechnungs- und Maildaten. Dasselbe gilt für `vereinsarchiv/`.
